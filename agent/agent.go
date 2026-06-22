@@ -191,6 +191,7 @@ func runAgent() error {
 			if len(envelope.Content) == 0 {
 				return fmt.Errorf("capability action %d missing content", i)
 			}
+			emitProgress(envelope.Action)
 			response, err := dispatch(call{Name: envelope.Action, Args: envelope.Content})
 			if err != nil {
 				return fmt.Errorf("execute capability action %d: %w", i, err)
@@ -411,6 +412,11 @@ func llmChat(messages []message) (string, error) {
 		return "", fmt.Errorf("provider returned no choices")
 	}
 	return chat.Choices[0].Message.Content, nil
+}
+
+func emitProgress(action string) {
+	msg, _ := json.Marshal(map[string]string{"message": "⚙ " + action})
+	dispatch(call{Name: "aurora.log", Args: msg})
 }
 
 func dispatch(c call) (hostResponse, error) {
