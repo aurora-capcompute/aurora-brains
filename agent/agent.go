@@ -191,7 +191,7 @@ func runAgent() error {
 			if len(envelope.Content) == 0 {
 				return fmt.Errorf("capability action %d missing content", i)
 			}
-			emitProgress(envelope.Action)
+			emitProgress(envelope.Action, envelope.Content)
 			response, err := dispatch(call{Name: envelope.Action, Args: envelope.Content})
 			if err != nil {
 				return fmt.Errorf("execute capability action %d: %w", i, err)
@@ -414,9 +414,46 @@ func llmChat(messages []message) (string, error) {
 	return chat.Choices[0].Message.Content, nil
 }
 
-func emitProgress(action string) {
-	msg, _ := json.Marshal(map[string]string{"message": "⚙ " + action})
+func emitProgress(action string, content json.RawMessage) {
+	summary := progressSummary(action, content)
+	msg, _ := json.Marshal(map[string]string{"message": summary})
 	dispatch(call{Name: "aurora.log", Args: msg})
+}
+
+func progressSummary(action string, content json.RawMessage) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(content, &fields) != nil {
+		return "⚙ " + action
+	}
+	switch {
+	case strings.HasPrefix(action, "call."):
+		if msg, ok := fields["message"]; ok {
+			var s string
+			if json.Unmarshal(msg, &s) == nil && len(s) > 0 {
+				if len(s) > 80 {
+					s = s[:80] + "…"
+				}
+				return "🔀 " + action + ": " + s
+			}
+		}
+		return "🔀 " + action
+	case strings.HasPrefix(action, "k8s.") || strings.HasPrefix(action, "helm."):
+		var parts []string
+		for _, key := range []string{"kind", "namespace", "name", "release", "chart", "api_version"} {
+			if raw, ok := fields[key]; ok {
+				var s string
+				if json.Unmarshal(raw, &s) == nil && s != "" {
+					parts = append(parts, s)
+				}
+			}
+		}
+		if len(parts) > 0 {
+			return "⚙ " + action + " " + strings.Join(parts, "/")
+		}
+		return "⚙ " + action
+	default:
+		return "⚙ " + action
+	}
 }
 
 func dispatch(c call) (hostResponse, error) {
