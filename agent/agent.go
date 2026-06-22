@@ -38,12 +38,22 @@ type message struct {
 }
 
 type llmRequest struct {
-	Messages []message `json:"messages"`
-	JSON     bool      `json:"json"`
+	Messages       []message          `json:"messages"`
+	ResponseFormat *llmResponseFormat `json:"response_format,omitempty"`
+}
+
+type llmResponseFormat struct {
+	Type string `json:"type"`
 }
 
 type llmResponse struct {
-	Content string `json:"content"`
+	Choices []llmChoice `json:"choices"`
+}
+
+type llmChoice struct {
+	Message struct {
+		Content string `json:"content"`
+	} `json:"message"`
 }
 
 type capability struct {
@@ -147,7 +157,7 @@ func runAgent() error {
 		if err != nil {
 			return err
 		}
-		envelopes, err := decodeModelEnvelopes(chat.Content)
+		envelopes, err := decodeModelEnvelopes(chat)
 		if err != nil {
 			return fmt.Errorf("invalid model JSON: %w", err)
 		}
@@ -166,7 +176,7 @@ func runAgent() error {
 			return outputFinal(*firstFinal)
 		}
 
-		messages = append(messages, message{Role: "assistant", Content: chat.Content})
+		messages = append(messages, message{Role: "assistant", Content: chat})
 		observations := make([]toolObservation, 0, len(envelopes))
 		for i, envelope := range envelopes {
 			if envelope.Action == "final" {
@@ -378,23 +388,29 @@ func decodeActionContent(content json.RawMessage, target any) error {
 	return nil
 }
 
-func llmChat(messages []message) (llmResponse, error) {
-	args, err := json.Marshal(llmRequest{Messages: messages, JSON: true})
+func llmChat(messages []message) (string, error) {
+	args, err := json.Marshal(llmRequest{
+		Messages:       messages,
+		ResponseFormat: &llmResponseFormat{Type: "json_object"},
+	})
 	if err != nil {
-		return llmResponse{}, fmt.Errorf("encode llm request: %w", err)
+		return "", fmt.Errorf("encode llm request: %w", err)
 	}
-	response, err := dispatch(call{Name: "llm.chat", Args: args})
+	response, err := dispatch(call{Name: "openai.chat", Args: args})
 	if err != nil {
-		return llmResponse{}, err
+		return "", err
 	}
 	if response.Status != "result" {
-		return llmResponse{}, fmt.Errorf("host failure: %s", response.Message)
+		return "", fmt.Errorf("host failure: %s", response.Message)
 	}
 	var chat llmResponse
 	if err := json.Unmarshal(response.Result, &chat); err != nil {
-		return llmResponse{}, fmt.Errorf("decode llm response: %w", err)
+		return "", fmt.Errorf("decode llm response: %w", err)
 	}
-	return chat, nil
+	if len(chat.Choices) == 0 {
+		return "", fmt.Errorf("provider returned no choices")
+	}
+	return chat.Choices[0].Message.Content, nil
 }
 
 func dispatch(c call) (hostResponse, error) {
