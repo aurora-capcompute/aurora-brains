@@ -123,9 +123,9 @@ func run() int32 {
 }
 
 func runAgent() error {
-	var in input
-	if err := pdk.InputJSON(&in); err != nil {
-		return fmt.Errorf("decode input: %w", err)
+	in, err := fetchInput()
+	if err != nil {
+		return err
 	}
 	if in.Message == "" {
 		return fmt.Errorf("message is required")
@@ -373,10 +373,41 @@ func outputFinal(envelope modelEnvelope) error {
 	if action.Answer == "" {
 		return fmt.Errorf("final action missing answer")
 	}
-	return pdk.OutputJSON(output{
-		Status: "completed",
-		Answer: action.Answer,
-	})
+	return finish(action.Answer)
+}
+
+// fetchInput retrieves the run input via the agent.input host call. Recording it
+// on the journal makes replay deterministic.
+func fetchInput() (input, error) {
+	response, err := dispatch(call{Name: "agent.input"})
+	if err != nil {
+		return input{}, err
+	}
+	if response.Status != "result" {
+		return input{}, fmt.Errorf("host failure: %s", response.Message)
+	}
+	var in input
+	if err := json.Unmarshal(response.Result, &in); err != nil {
+		return input{}, fmt.Errorf("decode input: %w", err)
+	}
+	return in, nil
+}
+
+// finish reports the run's answer via the agent.finish host call (recorded on the
+// journal, which is where the host reads the answer from) and signals completion.
+func finish(answer string) error {
+	args, err := json.Marshal(finishArgs{Answer: answer})
+	if err != nil {
+		return fmt.Errorf("encode finish: %w", err)
+	}
+	if _, err := dispatch(call{Name: "agent.finish", Args: args}); err != nil {
+		return err
+	}
+	return pdk.OutputJSON(output{Status: "completed"})
+}
+
+type finishArgs struct {
+	Answer string `json:"answer"`
 }
 
 func decodeActionContent(content json.RawMessage, target any) error {
