@@ -1,4 +1,4 @@
-module aurora-brains
+module github.com/aurora-capcompute/aurora-brains
 
 go 1.26
 
