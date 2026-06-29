@@ -20,7 +20,8 @@ const protocolPrompt = `You are an Aurora agent running inside a Wasm guest.
 The host owns all side effects. Reply with exactly one compact JSON object containing an "actions" array.
 Use only the tools listed below. Match each tool's input JSON schema exactly.
 You may request multiple independent tool calls in one turn. The host executes them sequentially and returns one aggregated observation array.
-Each observation has status "result" with content or status "failed" with an error. A failed tool call is recoverable: use other sources, retry when appropriate, or explain the limitation.
+Each observation has status "result" with content or status "failed" with an error. A failed tool call is recoverable by default: use other sources, retry when appropriate, or explain the limitation.
+Add "hard": true to a tool call only when its failure must abort the run so a later resume re-executes it (for example, a state-changing step the run cannot meaningfully continue without). Omit "hard" for all normal, recoverable calls.
 After receiving observations, either request more tools or return exactly one final action:
 {"actions":[{"action":"final","content":{"answer":"...","reason":"..."}}]}
 Never combine a final action with tool calls in the same actions array.`
@@ -65,6 +66,10 @@ type capability struct {
 type modelEnvelope struct {
 	Action  string          `json:"action"`
 	Content json.RawMessage `json:"content"`
+	// Hard marks a call whose failure must abort the run (with its savepoint left
+	// open) so a later resume re-executes it, instead of being reported back as a
+	// recoverable observation. Default (false) is the soft path.
+	Hard bool `json:"hard,omitempty"`
 }
 
 type modelDiagnostic struct {
@@ -192,7 +197,13 @@ func runAgent() error {
 				return fmt.Errorf("capability action %d missing content", i)
 			}
 			emitProgress(envelope.Action, envelope.Content)
-			response, err := dispatch(call{Name: envelope.Action, Args: envelope.Content})
+			toolCall := call{Name: envelope.Action, Args: envelope.Content}
+			var response hostResponse
+			if envelope.Hard {
+				response, err = dispatchHard(toolCall)
+			} else {
+				response, err = dispatch(toolCall)
+			}
 			if err != nil {
 				return fmt.Errorf("execute capability action %d: %w", i, err)
 			}
@@ -212,7 +223,7 @@ func runAgent() error {
 		if err != nil {
 			return fmt.Errorf("encode tool observations: %w", err)
 		}
-		messages = append(messages, message{Role: "tool", Content: string(rawObservations)})
+		messages = append(messages, message{Role: "user", Content: string(rawObservations)})
 	}
 }
 
@@ -509,4 +520,36 @@ func dispatch(c call) (hostResponse, error) {
 	default:
 		return hostResponse{}, fmt.Errorf("unsupported host outcome: %s", response.Status)
 	}
+}
+
+// Reserved savepoint markers. These must match the reserved names recognized by
+// the host (aurora-capcompute internal/host). They carry no side effect; the
+// host records them on the journal and uses an open host.try (one with no
+// matching host.commit) as the fork point when a failed run is resumed.
+const (
+	capTry    = "host.try"
+	capCommit = "host.commit"
+)
+
+// dispatchHard brackets a single call in a host.try/host.commit savepoint. On
+// success it commits and returns the result. On failure it leaves the try open
+// and returns an error that aborts the run, so a later resume forks right after
+// the try and re-executes the call under a new revision. A plain dispatch (the
+// default, "soft") instead records the failure for replay and lets the brain
+// react to it.
+func dispatchHard(c call) (hostResponse, error) {
+	if _, err := dispatch(call{Name: capTry}); err != nil {
+		return hostResponse{}, err
+	}
+	response, err := dispatch(c)
+	if err != nil {
+		return hostResponse{}, err
+	}
+	if response.Status == "failed" {
+		return response, fmt.Errorf("hard capability %q failed: %s", c.Name, response.Message)
+	}
+	if _, err := dispatch(call{Name: capCommit}); err != nil {
+		return hostResponse{}, err
+	}
+	return response, nil
 }
