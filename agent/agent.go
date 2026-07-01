@@ -467,35 +467,34 @@ func progressSummary(action string, content json.RawMessage) string {
 	if json.Unmarshal(content, &fields) != nil {
 		return "⚙ " + action
 	}
-	switch {
-	case strings.HasPrefix(action, "call."):
-		if msg, ok := fields["message"]; ok {
-			var s string
-			if json.Unmarshal(msg, &s) == nil && len(s) > 0 {
-				if len(s) > 80 {
-					s = s[:80] + "…"
-				}
-				return "🔀 " + action + ": " + s
+	// A delegation to a sub-agent carries a free-text message; tools are now
+	// addressed by their local name, so branch on the content shape rather than
+	// on a name prefix.
+	if msg, ok := fields["message"]; ok {
+		var s string
+		if json.Unmarshal(msg, &s) == nil && len(s) > 0 {
+			if len(s) > 80 {
+				s = s[:80] + "…"
 			}
+			return "🔀 " + action + ": " + s
 		}
 		return "🔀 " + action
-	case strings.HasPrefix(action, "k8s.") || strings.HasPrefix(action, "helm."):
-		var parts []string
-		for _, key := range []string{"kind", "namespace", "name", "release", "chart", "api_version"} {
-			if raw, ok := fields[key]; ok {
-				var s string
-				if json.Unmarshal(raw, &s) == nil && s != "" {
-					parts = append(parts, s)
-				}
+	}
+	// Otherwise surface identifying fields common to operational tools (the verb
+	// discriminator plus resource coordinates).
+	var parts []string
+	for _, key := range []string{"verb", "kind", "namespace", "name", "release", "chart", "api_version"} {
+		if raw, ok := fields[key]; ok {
+			var s string
+			if json.Unmarshal(raw, &s) == nil && s != "" {
+				parts = append(parts, s)
 			}
 		}
-		if len(parts) > 0 {
-			return "⚙ " + action + " " + strings.Join(parts, "/")
-		}
-		return "⚙ " + action
-	default:
-		return "⚙ " + action
 	}
+	if len(parts) > 0 {
+		return "⚙ " + action + " " + strings.Join(parts, "/")
+	}
+	return "⚙ " + action
 }
 
 func dispatch(c call) (hostResponse, error) {
