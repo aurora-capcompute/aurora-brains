@@ -3,14 +3,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
+mod wire;
+
 #[link(wasm_import_module = "extism:host/compute")]
 extern "C" {
     fn syscall(offset: u64) -> u64;
 }
 
 /// Syscall ABI this brain speaks (sys.ABIVersion in capcompute); the host
-/// rejects mismatches with code "bad_abi".
-const ABI_VERSION: i32 = 2;
+/// rejects mismatches with code "bad_abi". Since v3 the envelope is protobuf
+/// (src/wire.rs, mirroring capcompute sys/wire); args and results stay JSON
+/// payloads inside it.
+const ABI_VERSION: u32 = 3;
 
 const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm guest.\n\
 The host owns all side effects. Reply with exactly one compact JSON object containing an \"actions\" array.\n\
@@ -123,18 +127,15 @@ struct Call {
     args: Option<Value>,
 }
 
-#[derive(Deserialize)]
+// HostResponse is the brain's view of a wire::Response with the JSON result
+// payload already parsed; dispatch() builds it.
 struct HostResponse {
-    #[serde(default)]
     #[allow(dead_code)] // wire-contract field; not consumed yet
-    abi: i32,
+    abi: u32,
     status: String,
-    #[serde(default)]
     #[allow(dead_code)] // wire-contract field; not consumed yet
     code: String,
-    #[serde(default)]
     result: Option<Value>,
-    #[serde(default)]
     message: String,
 }
 
@@ -541,18 +542,46 @@ fn progress_summary(action: &str, content: &Value) -> String {
 }
 
 fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
-    let mut envelope = serde_json::to_value(c)
-        .map_err(|e| anyhow::anyhow!("encode call: {}", e))?;
-    envelope["abi"] = Value::from(ABI_VERSION);
-    let raw = serde_json::to_vec(&envelope)
-        .map_err(|e| anyhow::anyhow!("encode call: {}", e))?;
+    let args = match &c.args {
+        Some(value) => {
+            serde_json::to_vec(value).map_err(|e| anyhow::anyhow!("encode call args: {}", e))?
+        }
+        None => Vec::new(),
+    };
+    let raw = wire::encode_syscall(&wire::Syscall {
+        abi: ABI_VERSION,
+        name: c.name.clone(),
+        args,
+    });
     let mem = Memory::from_bytes(&raw)?;
     let response_offset = unsafe { syscall(mem.offset()) };
     mem.free();
     let response_mem = Memory::find(response_offset)
         .ok_or_else(|| anyhow::anyhow!("decode host response: invalid offset"))?;
-    let response: HostResponse = serde_json::from_slice(&response_mem.to_vec())
+    let decoded = wire::decode_response(&response_mem.to_vec())
         .map_err(|e| anyhow::anyhow!("decode host response: {}", e))?;
+
+    let status = match decoded.status {
+        wire::STATUS_RESULT => "result",
+        wire::STATUS_YIELD => "yield",
+        wire::STATUS_FAILED => "failed",
+        _ => "unspecified",
+    };
+    let result = if decoded.result.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_slice(&decoded.result)
+                .map_err(|e| anyhow::anyhow!("decode result payload: {}", e))?,
+        )
+    };
+    let response = HostResponse {
+        abi: decoded.abi,
+        status: status.to_string(),
+        code: decoded.code,
+        result,
+        message: decoded.message,
+    };
     match response.status.as_str() {
         "result" | "failed" => Ok(response),
         "yield" => Err(YieldedError.into()),

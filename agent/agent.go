@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/extism/go-pdk"
+
+	"github.com/aurora-capcompute/capcompute/sys/wire"
 )
 
 //go:wasmimport extism:host/compute syscall
@@ -100,22 +102,10 @@ type output struct {
 }
 
 // abiVersion is the syscall ABI this brain speaks (sys.ABIVersion in
-// capcompute); the host rejects mismatches with code "bad_abi".
-const abiVersion = 2
-
-type call struct {
-	Abi  int             `json:"abi"`
-	Name string          `json:"name"`
-	Args json.RawMessage `json:"args,omitempty"`
-}
-
-type hostResponse struct {
-	Abi     int             `json:"abi"`
-	Status  string          `json:"status"`
-	Code    string          `json:"code,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Message string          `json:"message,omitempty"`
-}
+// capcompute); the host rejects mismatches with code "bad_abi". Since v3 the
+// envelope is protobuf (capcompute sys/wire — the same codec the host runs);
+// args and results stay JSON payloads inside it.
+const abiVersion = 3
 
 var errYielded = errors.New("host yielded")
 
@@ -204,8 +194,8 @@ func runAgent() error {
 				return fmt.Errorf("capability action %d missing content", i)
 			}
 			emitProgress(envelope.Action, envelope.Content)
-			toolCall := call{Name: envelope.Action, Args: envelope.Content}
-			var response hostResponse
+			toolCall := wire.Syscall{Name: envelope.Action, Args: envelope.Content}
+			var response wire.Response
 			if envelope.Hard {
 				response, err = dispatchHard(toolCall)
 			} else {
@@ -216,10 +206,10 @@ func runAgent() error {
 			}
 			observation := toolObservation{
 				Action: envelope.Action,
-				Status: response.Status,
+				Status: statusString(response.Status),
 				Args:   envelope.Content,
 			}
-			if response.Status == "failed" {
+			if response.Status == wire.StatusFailed {
 				observation.Error = response.Message
 			} else {
 				observation.Content = response.Result
@@ -397,11 +387,11 @@ func outputFinal(envelope modelEnvelope) error {
 // fetchInput retrieves the run input via the agent.input host call. Recording it
 // on the journal makes replay deterministic.
 func fetchInput() (input, error) {
-	response, err := dispatch(call{Name: "agent.input"})
+	response, err := dispatch(wire.Syscall{Name: "agent.input"})
 	if err != nil {
 		return input{}, err
 	}
-	if response.Status != "result" {
+	if response.Status != wire.StatusResult {
 		return input{}, fmt.Errorf("host failure: %s", response.Message)
 	}
 	var in input
@@ -418,7 +408,7 @@ func finish(answer string) error {
 	if err != nil {
 		return fmt.Errorf("encode finish: %w", err)
 	}
-	if _, err := dispatch(call{Name: "agent.finish", Args: args}); err != nil {
+	if _, err := dispatch(wire.Syscall{Name: "agent.finish", Args: args}); err != nil {
 		return err
 	}
 	return pdk.OutputJSON(output{Status: "completed"})
@@ -446,11 +436,11 @@ func llmChat(messages []message) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("encode llm request: %w", err)
 	}
-	response, err := dispatch(call{Name: "openai.chat", Args: args})
+	response, err := dispatch(wire.Syscall{Name: "openai.chat", Args: args})
 	if err != nil {
 		return "", err
 	}
-	if response.Status != "result" {
+	if response.Status != wire.StatusResult {
 		return "", fmt.Errorf("host failure: %s", response.Message)
 	}
 	var chat llmResponse
@@ -466,7 +456,7 @@ func llmChat(messages []message) (string, error) {
 func emitProgress(action string, content json.RawMessage) {
 	summary := progressSummary(action, content)
 	msg, _ := json.Marshal(map[string]string{"message": summary})
-	dispatch(call{Name: "aurora.log", Args: msg})
+	dispatch(wire.Syscall{Name: "aurora.log", Args: msg})
 }
 
 func progressSummary(action string, content json.RawMessage) string {
@@ -504,28 +494,37 @@ func progressSummary(action string, content json.RawMessage) string {
 	return "⚙ " + action
 }
 
-func dispatch(c call) (hostResponse, error) {
+func dispatch(c wire.Syscall) (wire.Response, error) {
 	c.Abi = abiVersion
-	data, err := json.Marshal(c)
-	if err != nil {
-		return hostResponse{}, fmt.Errorf("encode call: %w", err)
-	}
-
-	request := pdk.AllocateBytes(data)
+	request := pdk.AllocateBytes(wire.EncodeSyscall(c))
 	defer request.Free()
 
 	responseOffset := hostSyscall(request.Offset())
-	var response hostResponse
-	if err := pdk.JSONFrom(responseOffset, &response); err != nil {
-		return hostResponse{}, fmt.Errorf("decode host response: %w", err)
+	response, err := wire.DecodeResponse(pdk.ParamBytes(responseOffset))
+	if err != nil {
+		return wire.Response{}, fmt.Errorf("decode host response: %w", err)
 	}
 	switch response.Status {
-	case "result", "failed":
+	case wire.StatusResult, wire.StatusFailed:
 		return response, nil
-	case "yield":
-		return hostResponse{}, errYielded
+	case wire.StatusYield:
+		return wire.Response{}, errYielded
 	default:
-		return hostResponse{}, fmt.Errorf("unsupported host outcome: %s", response.Status)
+		return wire.Response{}, fmt.Errorf("unsupported host outcome: %d", response.Status)
+	}
+}
+
+// statusString renders a wire status for the LLM-facing observation JSON.
+func statusString(status wire.Status) string {
+	switch status {
+	case wire.StatusResult:
+		return "result"
+	case wire.StatusYield:
+		return "yield"
+	case wire.StatusFailed:
+		return "failed"
+	default:
+		return "unspecified"
 	}
 }
 
@@ -544,19 +543,19 @@ const (
 // the try and re-executes the call under a new revision. A plain dispatch (the
 // default, "soft") instead records the failure for replay and lets the brain
 // react to it.
-func dispatchHard(c call) (hostResponse, error) {
-	if _, err := dispatch(call{Name: capTry}); err != nil {
-		return hostResponse{}, err
+func dispatchHard(c wire.Syscall) (wire.Response, error) {
+	if _, err := dispatch(wire.Syscall{Name: capTry}); err != nil {
+		return wire.Response{}, err
 	}
 	response, err := dispatch(c)
 	if err != nil {
-		return hostResponse{}, err
+		return wire.Response{}, err
 	}
-	if response.Status == "failed" {
+	if response.Status == wire.StatusFailed {
 		return response, fmt.Errorf("hard capability %q failed: %s", c.Name, response.Message)
 	}
-	if _, err := dispatch(call{Name: capCommit}); err != nil {
-		return hostResponse{}, err
+	if _, err := dispatch(wire.Syscall{Name: capCommit}); err != nil {
+		return wire.Response{}, err
 	}
 	return response, nil
 }
