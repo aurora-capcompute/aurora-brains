@@ -1,20 +1,8 @@
+use aurora_brain_sdk::{dispatch, dispatch_hard, yielded, Call};
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-
-mod wire;
-
-#[link(wasm_import_module = "extism:host/compute")]
-extern "C" {
-    fn syscall(offset: u64) -> u64;
-}
-
-/// Syscall ABI this brain speaks (sys.ABIVersion in capcompute); the host
-/// rejects mismatches with code "bad_abi". Since v3 the envelope is protobuf
-/// (src/wire.rs, mirroring capcompute sys/wire); args and results stay JSON
-/// payloads inside it.
-const ABI_VERSION: u32 = 3;
 
 const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm guest.\n\
 The host owns all side effects. Reply with exactly one compact JSON object containing an \"actions\" array.\n\
@@ -25,19 +13,6 @@ Add \"hard\": true to a tool call only when its failure must abort the run so a 
 After receiving observations, either request more tools or return exactly one final action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]}\n\
 Never combine a final action with tool calls in the same actions array.";
-
-// -- Yielded sentinel --
-
-#[derive(Debug)]
-struct YieldedError;
-
-impl std::fmt::Display for YieldedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "host yielded")
-    }
-}
-
-impl std::error::Error for YieldedError {}
 
 // -- Data structures --
 
@@ -121,25 +96,6 @@ struct ToolObservation {
 }
 
 #[derive(Serialize)]
-struct Call {
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    args: Option<Value>,
-}
-
-// HostResponse is the brain's view of a wire::Response with the JSON result
-// payload already parsed; dispatch() builds it.
-struct HostResponse {
-    #[allow(dead_code)] // wire-contract field; not consumed yet
-    abi: u32,
-    status: String,
-    #[allow(dead_code)] // wire-contract field; not consumed yet
-    code: String,
-    result: Option<Value>,
-    message: String,
-}
-
-#[derive(Serialize)]
 struct FinishArgs {
     answer: String,
 }
@@ -153,7 +109,7 @@ pub fn run(_: ()) -> FnResult<Json<Output>> {
             status: "completed",
             answer: String::new(),
         })),
-        Err(e) if e.downcast_ref::<YieldedError>().is_some() => Ok(Json(Output {
+        Err(e) if yielded(&e) => Ok(Json(Output {
             status: "yielded",
             answer: String::new(),
         })),
@@ -182,11 +138,7 @@ fn run_agent() -> anyhow::Result<()> {
 
     for (i, msg) in inp.history.iter().enumerate() {
         if msg.role != "user" && msg.role != "assistant" {
-            anyhow::bail!(
-                "history message {} has unsupported role {:?}",
-                i,
-                msg.role
-            );
+            anyhow::bail!("history message {} has unsupported role {:?}", i, msg.role);
         }
         if msg.content.is_empty() {
             anyhow::bail!("history message {} has empty content", i);
@@ -300,8 +252,9 @@ fn build_system_prompt(user_prompt: &str, capabilities: &[Capability]) -> anyhow
         } else {
             tool.input_schema.clone()
         };
-        let compact_schema = serde_json::to_string(&schema)
-            .map_err(|e| anyhow::anyhow!("capability {:?} has invalid input schema: {}", name, e))?;
+        let compact_schema = serde_json::to_string(&schema).map_err(|e| {
+            anyhow::anyhow!("capability {:?} has invalid input schema: {}", name, e)
+        })?;
         prompt.push_str(&format!("\n\nTool {}\nName: {}", i + 1, name));
         let description = tool.description.trim();
         if !description.is_empty() {
@@ -377,7 +330,7 @@ fn extract_json_region(content: &str) -> &str {
         // Cut at the closing fence when present.
         s = body.find("```").map(|i| &body[..i]).unwrap_or(body).trim();
     }
-    match s.find(|c| c == '{' || c == '[') {
+    match s.find(['{', '[']) {
         Some(i) => &s[i..],
         None => s,
     }
@@ -418,10 +371,7 @@ fn decode_model_envelope_object(value: Value) -> anyhow::Result<Vec<ModelEnvelop
             )
         })?;
     let content = value.get("content").cloned().unwrap_or(Value::Null);
-    let hard = value
-        .get("hard")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let hard = value.get("hard").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(vec![ModelEnvelope {
         action: action.to_string(),
         content,
@@ -461,8 +411,8 @@ fn fetch_input() -> anyhow::Result<Input> {
     let result = response
         .result
         .ok_or_else(|| anyhow::anyhow!("decode input: empty result"))?;
-    let inp: Input = serde_json::from_value(result)
-        .map_err(|e| anyhow::anyhow!("decode input: {}", e))?;
+    let inp: Input =
+        serde_json::from_value(result).map_err(|e| anyhow::anyhow!("decode input: {}", e))?;
     Ok(inp)
 }
 
@@ -527,7 +477,14 @@ fn progress_summary(action: &str, content: &Value) -> String {
     }
     if action.starts_with("k8s.") || action.starts_with("helm.") {
         let mut parts: Vec<&str> = Vec::new();
-        for key in &["kind", "namespace", "name", "release", "chart", "api_version"] {
+        for key in &[
+            "kind",
+            "namespace",
+            "name",
+            "release",
+            "chart",
+            "api_version",
+        ] {
             if let Some(s) = fields.get(*key).and_then(|v| v.as_str()) {
                 if !s.is_empty() {
                     parts.push(s);
@@ -539,81 +496,4 @@ fn progress_summary(action: &str, content: &Value) -> String {
         }
     }
     format!("⚙ {}", action)
-}
-
-fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
-    let args = match &c.args {
-        Some(value) => {
-            serde_json::to_vec(value).map_err(|e| anyhow::anyhow!("encode call args: {}", e))?
-        }
-        None => Vec::new(),
-    };
-    let raw = wire::encode_syscall(&wire::Syscall {
-        abi: ABI_VERSION,
-        name: c.name.clone(),
-        args,
-    });
-    let mem = Memory::from_bytes(&raw)?;
-    let response_offset = unsafe { syscall(mem.offset()) };
-    mem.free();
-    let response_mem = Memory::find(response_offset)
-        .ok_or_else(|| anyhow::anyhow!("decode host response: invalid offset"))?;
-    let decoded = wire::decode_response(&response_mem.to_vec())
-        .map_err(|e| anyhow::anyhow!("decode host response: {}", e))?;
-
-    let status = match decoded.status {
-        wire::STATUS_RESULT => "result",
-        wire::STATUS_YIELD => "yield",
-        wire::STATUS_FAILED => "failed",
-        _ => "unspecified",
-    };
-    let result = if decoded.result.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_slice(&decoded.result)
-                .map_err(|e| anyhow::anyhow!("decode result payload: {}", e))?,
-        )
-    };
-    let response = HostResponse {
-        abi: decoded.abi,
-        status: status.to_string(),
-        code: decoded.code,
-        result,
-        message: decoded.message,
-    };
-    match response.status.as_str() {
-        "result" | "failed" => Ok(response),
-        "yield" => Err(YieldedError.into()),
-        other => Err(anyhow::anyhow!("unsupported host outcome: {}", other)),
-    }
-}
-
-// Reserved savepoint markers. These must match the reserved names recognized by
-// the host (aurora-capcompute internal/host). They carry no side effect; the
-// host records them on the journal and uses an open sys.begin (one with no
-// matching sys.commit) as the fork point when a failed run is resumed.
-const CAP_TRY: &str = "sys.begin";
-const CAP_COMMIT: &str = "sys.commit";
-
-// dispatch_hard brackets a single call in a host.try/host.commit savepoint. On
-// success it commits and returns the result. On failure it leaves the try open
-// and returns an error that aborts the run, so a later resume forks right after
-// the try and re-executes the call under a new revision. A plain dispatch (the
-// default, "soft") instead records the failure for replay and lets the brain
-// react to it.
-fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
-    dispatch(&Call {
-        name: CAP_TRY.into(),
-        args: None,
-    })?;
-    let response = dispatch(c)?;
-    if response.status == "failed" {
-        anyhow::bail!("hard capability {:?} failed: {}", c.name, response.message);
-    }
-    dispatch(&Call {
-        name: CAP_COMMIT.into(),
-        args: None,
-    })?;
-    Ok(response)
 }

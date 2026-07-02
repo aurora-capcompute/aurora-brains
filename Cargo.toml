@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["sdk", "brains/agent"]
+
+# Every brain is one crate under brains/<name>/, compiled to wasm32-wasip1 as
+# a cdylib. New brain: copy brains/agent/Cargo.toml, depend on the sdk, write
+# src/lib.rs, add the member here.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+aurora-brain-sdk = { path = "sdk" }
+anyhow = "1"
+extism-pdk = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,10 @@
+[package]
+name = "aurora-brain-sdk"
+description = "Everything an Aurora brain needs to speak the syscall boundary: the ABI v3 wire codec and the dispatch protocol (yield, savepoints, hard calls)."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+extism-pdk.workspace = true
+serde_json.workspace = true
