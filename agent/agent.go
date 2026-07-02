@@ -13,8 +13,8 @@ import (
 	"github.com/extism/go-pdk"
 )
 
-//go:wasmimport extism:host/compute play
-func hostPlay(uint64) uint64
+//go:wasmimport extism:host/compute syscall
+func hostSyscall(uint64) uint64
 
 const protocolPrompt = `You are an Aurora agent running inside a Wasm guest.
 The host owns all side effects. Reply with exactly one compact JSON object containing an "actions" array.
@@ -506,7 +506,7 @@ func dispatch(c call) (hostResponse, error) {
 	request := pdk.AllocateBytes(data)
 	defer request.Free()
 
-	responseOffset := hostPlay(request.Offset())
+	responseOffset := hostSyscall(request.Offset())
 	var response hostResponse
 	if err := pdk.JSONFrom(responseOffset, &response); err != nil {
 		return hostResponse{}, fmt.Errorf("decode host response: %w", err)
