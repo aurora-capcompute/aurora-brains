@@ -5,8 +5,12 @@ use std::collections::HashSet;
 
 #[link(wasm_import_module = "extism:host/compute")]
 extern "C" {
-    fn play(offset: u64) -> u64;
+    fn syscall(offset: u64) -> u64;
 }
+
+/// Syscall ABI this brain speaks (sys.ABIVersion in capcompute); the host
+/// rejects mismatches with code "bad_abi".
+const ABI_VERSION: i32 = 2;
 
 const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm guest.\n\
 The host owns all side effects. Reply with exactly one compact JSON object containing an \"actions\" array.\n\
@@ -121,7 +125,12 @@ struct Call {
 
 #[derive(Deserialize)]
 struct HostResponse {
+    #[serde(default)]
+    abi: i32,
     status: String,
+    #[serde(default)]
+    #[allow(dead_code)] // wire-contract field; not consumed yet
+    code: String,
     #[serde(default)]
     result: Option<Value>,
     #[serde(default)]
@@ -531,10 +540,13 @@ fn progress_summary(action: &str, content: &Value) -> String {
 }
 
 fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
-    let raw = serde_json::to_vec(c)
+    let mut envelope = serde_json::to_value(c)
+        .map_err(|e| anyhow::anyhow!("encode call: {}", e))?;
+    envelope["abi"] = Value::from(ABI_VERSION);
+    let raw = serde_json::to_vec(&envelope)
         .map_err(|e| anyhow::anyhow!("encode call: {}", e))?;
     let mem = Memory::from_bytes(&raw)?;
-    let response_offset = unsafe { play(mem.offset()) };
+    let response_offset = unsafe { syscall(mem.offset()) };
     mem.free();
     let response_mem = Memory::find(response_offset)
         .ok_or_else(|| anyhow::anyhow!("decode host response: invalid offset"))?;
@@ -549,10 +561,10 @@ fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
 
 // Reserved savepoint markers. These must match the reserved names recognized by
 // the host (aurora-capcompute internal/host). They carry no side effect; the
-// host records them on the journal and uses an open host.try (one with no
-// matching host.commit) as the fork point when a failed run is resumed.
-const CAP_TRY: &str = "host.try";
-const CAP_COMMIT: &str = "host.commit";
+// host records them on the journal and uses an open sys.begin (one with no
+// matching sys.commit) as the fork point when a failed run is resumed.
+const CAP_TRY: &str = "sys.begin";
+const CAP_COMMIT: &str = "sys.commit";
 
 // dispatch_hard brackets a single call in a host.try/host.commit savepoint. On
 // success it commits and returns the result. On failure it leaves the try open

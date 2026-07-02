@@ -99,13 +99,20 @@ type output struct {
 	Answer string `json:"answer"`
 }
 
+// abiVersion is the syscall ABI this brain speaks (sys.ABIVersion in
+// capcompute); the host rejects mismatches with code "bad_abi".
+const abiVersion = 2
+
 type call struct {
+	Abi  int             `json:"abi"`
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args,omitempty"`
 }
 
 type hostResponse struct {
+	Abi     int             `json:"abi"`
 	Status  string          `json:"status"`
+	Code    string          `json:"code,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Message string          `json:"message,omitempty"`
 }
@@ -498,6 +505,7 @@ func progressSummary(action string, content json.RawMessage) string {
 }
 
 func dispatch(c call) (hostResponse, error) {
+	c.Abi = abiVersion
 	data, err := json.Marshal(c)
 	if err != nil {
 		return hostResponse{}, fmt.Errorf("encode call: %w", err)
@@ -521,13 +529,13 @@ func dispatch(c call) (hostResponse, error) {
 	}
 }
 
-// Reserved savepoint markers. These must match the reserved names recognized by
-// the host (aurora-capcompute internal/host). They carry no side effect; the
-// host records them on the journal and uses an open host.try (one with no
-// matching host.commit) as the fork point when a failed run is resumed.
+// Reserved savepoint syscalls (sys.SyscallBegin/sys.SyscallCommit in
+// capcompute). They carry no side effect; the host records them on the journal
+// and uses an open sys.begin (one with no matching sys.commit) as the fork
+// point when a failed run is resumed. Brackets have stack semantics.
 const (
-	capTry    = "host.try"
-	capCommit = "host.commit"
+	capTry    = "sys.begin"
+	capCommit = "sys.commit"
 )
 
 // dispatchHard brackets a single call in a host.try/host.commit savepoint. On
