@@ -126,6 +126,7 @@ struct Call {
 #[derive(Deserialize)]
 struct HostResponse {
     #[serde(default)]
+    #[allow(dead_code)] // wire-contract field; not consumed yet
     abi: i32,
     status: String,
     #[serde(default)]
