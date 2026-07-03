@@ -152,6 +152,14 @@ fn run_agent() -> anyhow::Result<()> {
     });
 
     loop {
+        // Each agentic turn — one LLM call plus the tool calls it requests —
+        // is a savepoint: sys.begin here, sys.commit at the turn's end. If the
+        // turn breaks mid-way (a malformed model reply, an unavailable
+        // capability, an aborted delegation), the savepoint is left open and a
+        // resumed run forks right after it, re-executing the WHOLE turn live —
+        // including the LLM call, giving the model a fresh chance — instead of
+        // deterministically replaying the broken completion forever.
+        begin_turn()?;
         let chat = llm_chat(&messages)?;
         let envelopes = decode_model_envelopes(&chat)
             .map_err(|e| anyhow::anyhow!("invalid model JSON: {}", e))?;
@@ -161,6 +169,7 @@ fn run_agent() -> anyhow::Result<()> {
 
         if !has_tool {
             if let Some(idx) = first_final_idx {
+                commit_turn()?;
                 return output_final(&envelopes[idx]);
             }
         }
@@ -226,7 +235,26 @@ fn run_agent() -> anyhow::Result<()> {
             role: "user".into(),
             content: raw_obs,
         });
+        commit_turn()?;
     }
+}
+
+// begin_turn/commit_turn bracket one agentic turn in a kernel savepoint (see
+// the loop in run_agent). The markers are journaled, side-effect-free syscalls.
+fn begin_turn() -> anyhow::Result<()> {
+    dispatch(&Call {
+        name: aurora_brain_sdk::SYS_BEGIN.into(),
+        args: None,
+    })?;
+    Ok(())
+}
+
+fn commit_turn() -> anyhow::Result<()> {
+    dispatch(&Call {
+        name: aurora_brain_sdk::SYS_COMMIT.into(),
+        args: None,
+    })?;
+    Ok(())
 }
 
 fn build_system_prompt(user_prompt: &str, capabilities: &[Capability]) -> anyhow::Result<String> {
