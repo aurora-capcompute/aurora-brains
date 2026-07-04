@@ -430,7 +430,7 @@ fn output_final(envelope: &ModelEnvelope) -> anyhow::Result<()> {
 
 fn fetch_input() -> anyhow::Result<Input> {
     let response = dispatch(&Call {
-        name: "agent.input".into(),
+        name: "sys.input".into(),
         args: None,
     })?;
     if response.status != "result" {
@@ -449,7 +449,7 @@ fn finish(answer: &str) -> anyhow::Result<()> {
         answer: answer.to_string(),
     })?;
     dispatch(&Call {
-        name: "agent.finish".into(),
+        name: "sys.output".into(),
         args: Some(args),
     })?;
     Ok(())
@@ -480,7 +480,7 @@ fn emit_progress(action: &str, content: &Value) {
     let summary = progress_summary(action, content);
     let args = serde_json::json!({ "message": summary });
     let _ = dispatch(&Call {
-        name: "aurora.log".into(),
+        name: "sys.log".into(),
         args: Some(args),
     });
 }
