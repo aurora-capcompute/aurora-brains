@@ -235,16 +235,19 @@ pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
 }
 
 /// compensate registers an effect's undo, to run only if the section later
-/// aborts: `name` is the granted capability to dispatch and `args` its exact
-/// arguments — built from the effect's result (e.g. the charge id a refund
-/// needs), so the undo is concrete, not generic. Register immediately after
-/// the effect succeeds. The host validates the name against the grant set and
-/// journals the deferred call; a rejected registration comes back as a failed
-/// response.
-pub fn compensate(name: &str, args: Value) -> anyhow::Result<HostResponse> {
+/// aborts. It takes the same [`Call`] a [`dispatch`] does — the undo IS a
+/// syscall, validated against the grant set like any other; the only
+/// difference is when it runs. Build the args from the effect's result (e.g.
+/// the charge id a refund needs) and register immediately after the effect
+/// succeeds; the host journals the deferred call without executing it.
+pub fn compensate(c: &Call) -> anyhow::Result<HostResponse> {
+    let mut args = serde_json::json!({ "name": c.name });
+    if let Some(call_args) = &c.args {
+        args["args"] = call_args.clone();
+    }
     dispatch(&Call {
         name: SYS_COMPENSATE.into(),
-        args: Some(serde_json::json!({ "name": name, "args": args })),
+        args: Some(args),
     })
 }
 
