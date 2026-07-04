@@ -1,4 +1,5 @@
-use aurora_brain_sdk::{dispatch, dispatch_hard, yielded, Call};
+use aurora_brain_sdk as sdk;
+use aurora_brain_sdk::{Call, Capability};
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,15 +38,6 @@ struct Input {
 struct Message {
     role: String,
     content: String,
-}
-
-#[derive(Deserialize)]
-struct Capability {
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    input_schema: Value,
 }
 
 #[derive(Serialize)]
@@ -109,7 +101,7 @@ pub fn run(_: ()) -> FnResult<Json<Output>> {
             status: "completed",
             answer: String::new(),
         })),
-        Err(e) if yielded(&e) => Ok(Json(Output {
+        Err(e) if sdk::yielded(&e) => Ok(Json(Output {
             status: "yielded",
             answer: String::new(),
         })),
@@ -118,7 +110,7 @@ pub fn run(_: ()) -> FnResult<Json<Output>> {
 }
 
 fn run_agent() -> anyhow::Result<()> {
-    let inp = fetch_input()?;
+    let inp: Input = sdk::input()?;
     if inp.message.is_empty() {
         anyhow::bail!("message is required");
     }
@@ -131,8 +123,10 @@ fn run_agent() -> anyhow::Result<()> {
         content: system_prompt,
     });
 
+    // Hidden capabilities stay dispatchable but off this brain's menu, so the
+    // model never sees them and never gets to request one.
     let mut allowed: HashSet<&str> = HashSet::with_capacity(inp.capabilities.len());
-    for cap in &inp.capabilities {
+    for cap in inp.capabilities.iter().filter(|c| !c.hidden) {
         allowed.insert(cap.name.as_str());
     }
 
@@ -159,7 +153,7 @@ fn run_agent() -> anyhow::Result<()> {
         // resumed run forks right after it, re-executing the WHOLE turn live —
         // including the LLM call, giving the model a fresh chance — instead of
         // deterministically replaying the broken completion forever.
-        begin_turn()?;
+        let turn = sdk::savepoint()?;
         let chat = llm_chat(&messages)?;
         let envelopes = decode_model_envelopes(&chat)
             .map_err(|e| anyhow::anyhow!("invalid model JSON: {}", e))?;
@@ -169,7 +163,7 @@ fn run_agent() -> anyhow::Result<()> {
 
         if !has_tool {
             if let Some(idx) = first_final_idx {
-                commit_turn()?;
+                turn.commit()?;
                 return output_final(&envelopes[idx]);
             }
         }
@@ -200,14 +194,14 @@ fn run_agent() -> anyhow::Result<()> {
                 args: Some(envelope.content.clone()),
             };
             let response = if envelope.hard {
-                dispatch_hard(&tool_call)?
+                sdk::dispatch_hard(&tool_call)?
             } else {
-                dispatch(&tool_call)?
+                sdk::dispatch(&tool_call)?
             };
-            let obs = if response.status == "failed" {
+            let obs = if response.status == sdk::STATUS_FAILED {
                 ToolObservation {
                     action: envelope.action.clone(),
-                    status: "failed".into(),
+                    status: sdk::STATUS_FAILED.into(),
                     args: Some(envelope.content.clone()),
                     content: None,
                     error: Some(response.message),
@@ -235,26 +229,8 @@ fn run_agent() -> anyhow::Result<()> {
             role: "user".into(),
             content: raw_obs,
         });
-        commit_turn()?;
+        turn.commit()?;
     }
-}
-
-// begin_turn/commit_turn bracket one agentic turn in a kernel savepoint (see
-// the loop in run_agent). The markers are journaled, side-effect-free syscalls.
-fn begin_turn() -> anyhow::Result<()> {
-    dispatch(&Call {
-        name: aurora_brain_sdk::SYS_BEGIN.into(),
-        args: None,
-    })?;
-    Ok(())
-}
-
-fn commit_turn() -> anyhow::Result<()> {
-    dispatch(&Call {
-        name: aurora_brain_sdk::SYS_COMMIT.into(),
-        args: None,
-    })?;
-    Ok(())
 }
 
 fn build_system_prompt(user_prompt: &str, capabilities: &[Capability]) -> anyhow::Result<String> {
@@ -266,11 +242,13 @@ fn build_system_prompt(user_prompt: &str, capabilities: &[Capability]) -> anyhow
     }
     prompt.push_str(PROTOCOL_PROMPT);
     prompt.push_str("\n\nAvailable tools for this run:");
-    if capabilities.is_empty() {
+    // Hidden capabilities are dispatchable but kept off the discoverable menu.
+    let visible: Vec<&Capability> = capabilities.iter().filter(|c| !c.hidden).collect();
+    if visible.is_empty() {
         prompt.push_str("\nNone. Return a final action without attempting a tool call.");
         return Ok(prompt);
     }
-    for (i, tool) in capabilities.iter().enumerate() {
+    for (i, tool) in visible.iter().enumerate() {
         let name = tool.name.trim();
         if name.is_empty() {
             anyhow::bail!("capability {} name is required", i);
@@ -425,44 +403,19 @@ fn output_final(envelope: &ModelEnvelope) -> anyhow::Result<()> {
     if action.answer.is_empty() {
         anyhow::bail!("final action missing answer");
     }
-    finish(&action.answer)
-}
-
-fn fetch_input() -> anyhow::Result<Input> {
-    let response = dispatch(&Call {
-        name: "sys.input".into(),
-        args: None,
-    })?;
-    if response.status != "result" {
-        anyhow::bail!("host failure: {}", response.message);
-    }
-    let result = response
-        .result
-        .ok_or_else(|| anyhow::anyhow!("decode input: empty result"))?;
-    let inp: Input =
-        serde_json::from_value(result).map_err(|e| anyhow::anyhow!("decode input: {}", e))?;
-    Ok(inp)
-}
-
-fn finish(answer: &str) -> anyhow::Result<()> {
-    let args = serde_json::to_value(FinishArgs {
-        answer: answer.to_string(),
-    })?;
-    dispatch(&Call {
-        name: "sys.output".into(),
-        args: Some(args),
-    })?;
-    Ok(())
+    sdk::output(&FinishArgs {
+        answer: action.answer,
+    })
 }
 
 fn llm_chat(messages: &[Message]) -> anyhow::Result<String> {
     let req = LlmRequest { messages };
     let args = serde_json::to_value(&req)?;
-    let response = dispatch(&Call {
+    let response = sdk::dispatch(&Call {
         name: "openai.chat".into(),
         args: Some(args),
     })?;
-    if response.status != "result" {
+    if response.status != sdk::STATUS_RESULT {
         anyhow::bail!("host failure: {}", response.message);
     }
     let result = response
@@ -477,12 +430,7 @@ fn llm_chat(messages: &[Message]) -> anyhow::Result<String> {
 }
 
 fn emit_progress(action: &str, content: &Value) {
-    let summary = progress_summary(action, content);
-    let args = serde_json::json!({ "message": summary });
-    let _ = dispatch(&Call {
-        name: "sys.log".into(),
-        args: Some(args),
-    });
+    sdk::log(&progress_summary(action, content));
 }
 
 fn progress_summary(action: &str, content: &Value) -> String {

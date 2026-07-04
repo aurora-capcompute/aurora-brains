@@ -7,4 +7,5 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 extism-pdk.workspace = true
+serde.workspace = true
 serde_json.workspace = true

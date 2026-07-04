@@ -1,13 +1,20 @@
 //! The Aurora brain SDK: everything a guest brain needs to speak the syscall
 //! boundary, so a brain crate contains only cognition. It owns the ABI v3
-//! wire codec ([`wire`]), the single `extism:host/compute syscall` import,
-//! and the dispatch protocol — result/failed observations, the yield
-//! sentinel, and savepoint-bracketed "hard" calls.
+//! wire codec ([`wire`]), the single `extism:host/compute` syscall import, and
+//! the dispatch protocol — result/failed observations, the yield sentinel,
+//! [`savepoint`]s, and savepoint-bracketed "hard" calls ([`dispatch_hard`]).
+//!
+//! On top of that it owns the typed plumbing a brain would otherwise
+//! re-implement by hand: [`input`]/[`output`] for the run's payloads, [`log`]
+//! for progress, and the decoded [`Capability`] menu the host grants. What is
+//! left for the brain is cognition.
 //!
 //! A brain is one cdylib crate under `brains/<name>/` that depends on this
 //! SDK and exports its entrypoint with `#[plugin_fn]`.
 
 use extism_pdk::Memory;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod wire;
@@ -30,6 +37,23 @@ pub const ABI_VERSION: u32 = 3;
 /// wraps one call in them.
 pub const SYS_BEGIN: &str = "sys.begin";
 pub const SYS_COMMIT: &str = "sys.commit";
+
+/// Reserved names for the guest↔host protocol plumbing the kernel handles
+/// itself (not a dispatcher): fetch this run's input ([`input`]), publish its
+/// result ([`output`]), and emit a progress line ([`log`]).
+pub const SYS_INPUT: &str = "sys.input";
+pub const SYS_OUTPUT: &str = "sys.output";
+pub const SYS_LOG: &str = "sys.log";
+
+/// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
+/// recoverable observations the brain can react to; "yield" never reaches the
+/// caller as a response (it surfaces as [`YieldedError`]), and "unspecified"
+/// covers a status the host left unset. These are the decoded-string mirror of
+/// the wire status codes ([`wire::STATUS_RESULT`] and friends).
+pub const STATUS_RESULT: &str = "result";
+pub const STATUS_YIELD: &str = "yield";
+pub const STATUS_FAILED: &str = "failed";
+pub const STATUS_UNSPECIFIED: &str = "unspecified";
 
 /// YieldedError is the yield sentinel: the host parked this run on external
 /// work (an approval, a timer, a message). Bubble it up and return
@@ -95,10 +119,10 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
         .map_err(|e| anyhow::anyhow!("decode host response: {}", e))?;
 
     let status = match decoded.status {
-        wire::STATUS_RESULT => "result",
-        wire::STATUS_YIELD => "yield",
-        wire::STATUS_FAILED => "failed",
-        _ => "unspecified",
+        wire::STATUS_RESULT => STATUS_RESULT,
+        wire::STATUS_YIELD => STATUS_YIELD,
+        wire::STATUS_FAILED => STATUS_FAILED,
+        _ => STATUS_UNSPECIFIED,
     };
     let result = if decoded.result.is_empty() {
         None
@@ -117,30 +141,135 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
         labels: decoded.labels,
     };
     match response.status.as_str() {
-        "result" | "failed" => Ok(response),
-        "yield" => Err(YieldedError.into()),
+        STATUS_RESULT | STATUS_FAILED => Ok(response),
+        STATUS_YIELD => Err(YieldedError.into()),
         other => Err(anyhow::anyhow!("unsupported host outcome: {}", other)),
     }
 }
 
-/// dispatch_hard brackets a single call in a sys.begin/sys.commit savepoint.
-/// On success it commits and returns the result. On failure it leaves the
-/// begin open and returns an error that aborts the run, so a later resume
-/// forks right after the begin and re-executes the call under a new revision.
-/// A plain [`dispatch`] (the default, "soft") instead records the failure for
-/// replay and lets the brain react to it.
-pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
+/// A Savepoint brackets a critical zone in a sys.begin/sys.commit pair. Open one
+/// with [`savepoint`] and close it with [`Savepoint::commit`] once the zone has
+/// succeeded; *dropping it without committing* leaves the sys.begin open, so a
+/// resumed run forks right after it and re-executes the whole zone live. That
+/// drop-aborts behavior is the point — propagate an error out of the zone (with
+/// `?`) and the savepoint unwinds the run for you. Brackets have stack
+/// semantics; [`dispatch_hard`] wraps a single call this way.
+#[must_use = "a Savepoint aborts the run unless it is committed"]
+#[non_exhaustive]
+pub struct Savepoint {}
+
+impl Savepoint {
+    /// commit closes the savepoint with a sys.commit marker, keeping the zone's
+    /// effects on the happy path.
+    pub fn commit(self) -> anyhow::Result<()> {
+        dispatch(&Call {
+            name: SYS_COMMIT.into(),
+            args: None,
+        })?;
+        Ok(())
+    }
+}
+
+/// savepoint opens a sys.begin marker and returns the [`Savepoint`] guard for a
+/// critical zone. See [`Savepoint`] for the commit-or-abort contract.
+pub fn savepoint() -> anyhow::Result<Savepoint> {
     dispatch(&Call {
         name: SYS_BEGIN.into(),
         args: None,
     })?;
+    Ok(Savepoint {})
+}
+
+/// dispatch_hard brackets a single call in a [`savepoint`]. On success it commits
+/// and returns the result. On failure it leaves the begin open and returns an
+/// error that aborts the run, so a later resume forks right after the begin and
+/// re-executes the call under a new revision. A plain [`dispatch`] (the default,
+/// "soft") instead records the failure for replay and lets the brain react to it.
+pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
+    let sp = savepoint()?;
     let response = dispatch(c)?;
-    if response.status == "failed" {
+    if response.status == STATUS_FAILED {
         anyhow::bail!("hard capability {:?} failed: {}", c.name, response.message);
     }
-    dispatch(&Call {
-        name: SYS_COMMIT.into(),
+    sp.commit()?;
+    Ok(response)
+}
+
+/// input fetches this run's input payload with the sys.input syscall and
+/// deserializes it into `T` — the typed front door a brain uses instead of
+/// dispatching sys.input by hand.
+pub fn input<T: DeserializeOwned>() -> anyhow::Result<T> {
+    let response = dispatch(&Call {
+        name: SYS_INPUT.into(),
         args: None,
     })?;
-    Ok(response)
+    if response.status != STATUS_RESULT {
+        anyhow::bail!("host failed to provide input: {}", response.message);
+    }
+    let result = response
+        .result
+        .ok_or_else(|| anyhow::anyhow!("decode input: empty result"))?;
+    serde_json::from_value(result).map_err(|e| anyhow::anyhow!("decode input: {}", e))
+}
+
+/// output publishes this run's result payload with the sys.output syscall.
+pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    let args = serde_json::to_value(value).map_err(|e| anyhow::anyhow!("encode output: {}", e))?;
+    dispatch(&Call {
+        name: SYS_OUTPUT.into(),
+        args: Some(args),
+    })?;
+    Ok(())
+}
+
+/// log emits a human-readable progress line with the sys.log syscall. Logging is
+/// best-effort observability: any failure (or a host yield) is swallowed so it
+/// never perturbs the run.
+pub fn log(message: &str) {
+    let args = serde_json::json!({ "message": message });
+    let _ = dispatch(&Call {
+        name: SYS_LOG.into(),
+        args: Some(args),
+    });
+}
+
+/// Capability is one tool the host has granted this run — the guest's decoded
+/// view of capcompute's `sys.Capability`. A brain reads `name`/`description`/
+/// `input_schema` to build its tool menu, and may consult `hidden` (keep a
+/// dispatchable tool off that menu), `labels`/`forbid` (the provenance a result
+/// carries and the labels barred from its args), and `compensation` (saga undo)
+/// to shape or gate the menu. Decode-only: the host owns the record.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Capability {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: Value,
+    /// Dispatchable, but excluded from the brain's discoverable tool menu.
+    #[serde(default)]
+    pub hidden: bool,
+    /// How a completed effect of this capability is undone when a scope aborts.
+    #[serde(default)]
+    pub compensation: Compensation,
+    /// Source classes this capability's results carry (taint labels).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Labels that may not flow into this capability's args.
+    #[serde(default)]
+    pub forbid: Vec<String>,
+}
+
+/// Compensation declares how to undo a completed effect of a [`Capability`]
+/// (saga compensation). The default — an empty `kind` — escalates: the effect is
+/// assumed irreversible and unwinding surfaces it to a human.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Compensation {
+    /// "none" (read-only), "syscall" (dispatch the inverse named below), or
+    /// "escalate"/"" (irreversible).
+    #[serde(default)]
+    pub kind: String,
+    /// The inverse capability to dispatch when `kind` is "syscall".
+    #[serde(default)]
+    pub syscall: String,
 }

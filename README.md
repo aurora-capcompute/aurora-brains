@@ -13,12 +13,16 @@ replayable, and auditable by the host.
 Cargo.toml        the workspace: shared versions and dependencies
 sdk/              aurora-brain-sdk — everything every brain needs:
                     the ABI v3 wire codec (proto3, hand-rolled, pinned to the
-                    host by shared golden fixtures) and the dispatch protocol
+                    host by shared golden fixtures); the dispatch protocol
                     (result/failed observations, the yield sentinel,
-                    savepoint-bracketed "hard" calls)
+                    savepoints, savepoint-bracketed "hard" calls); and the
+                    typed plumbing — input/output/log and the decoded
+                    Capability menu the host grants
 brains/
   agent/          the general-purpose agent: a tool-calling LLM loop over
                     whatever capabilities its manifest grants
+  echo/           the smallest brain: no LLM, just input→output — the
+                    multi-program path on the shared SDK
 ```
 
 A brain crate contains only cognition; the boundary lives in the SDK.
@@ -35,18 +39,19 @@ or directly:
 cargo build --release --target wasm32-wasip1 -p agent-brain
 ```
 
-## Adding a new brain
+See `brains/echo` for the smallest possible brain — input→output with no LLM.
 
-1. `mkdir -p brains/<name>/src` and copy `brains/agent/Cargo.toml`, changing
+1. `mkdir -p brains/<name>/src` and copy `brains/echo/Cargo.toml`, changing
    the package name and description.
 2. Add `"brains/<name>"` to the workspace members in the root `Cargo.toml`.
-3. Write `src/lib.rs`: depend on `aurora_brain_sdk::{dispatch, dispatch_hard,
-   yielded, Call}` and export the entrypoint with `#[plugin_fn]`. Return
-   `{"status":"completed",...}` or bubble the yield sentinel up and return
-   `{"status":"yielded"}`.
-4. Keep the brain deterministic: no clocks, no randomness, no I/O outside
-   `dispatch` — the kernel pins the ambient sources and the journal replays
-   the rest.
+3. Write `src/lib.rs`: read the run's input with `sdk::input`, do the
+   cognition, report the result with `sdk::output` (and `sdk::log` for
+   progress), and export the entrypoint with `#[plugin_fn]`. Return
+   `{"status":"completed"}` or bubble the yield sentinel (`sdk::yielded`) up
+   and return `{"status":"yielded"}`.
+4. Keep the brain deterministic: no clocks, no randomness, no I/O outside the
+   SDK's syscalls — the kernel pins the ambient sources and the journal
+   replays the rest.
 
 ## Tests
 
