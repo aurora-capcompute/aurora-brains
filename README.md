@@ -15,9 +15,13 @@ sdk/              aurora-brain-sdk — everything every brain needs:
                     the ABI v3 wire codec (proto3, hand-rolled, pinned to the
                     host by shared golden fixtures); the dispatch protocol
                     (result/failed observations, the yield sentinel,
-                    savepoints, savepoint-bracketed "hard" calls); and the
+                    savepoints, savepoint-bracketed "hard" calls); the
                     typed plumbing — input/output/log and the decoded
-                    Capability menu the host grants
+                    Capability menu the host grants; and rollback —
+                    compensate(&Call) registers an effect's undo (deferred,
+                    journaled, same shape as a dispatch) and abort(reason,
+                    retry_seconds) undoes the registered effects newest-first,
+                    then retries the section after the delay or stops
 brains/
   agent/          the general-purpose agent: a tool-calling LLM loop over
                     whatever capabilities its manifest grants
