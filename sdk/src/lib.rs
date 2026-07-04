@@ -239,16 +239,22 @@ pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
 /// syscall, validated against the grant set like any other; the only
 /// difference is when it runs. Build the args from the effect's result (e.g.
 /// the charge id a refund needs) and register immediately after the effect
-/// succeeds; the host journals the deferred call without executing it.
-pub fn compensate(c: &Call) -> anyhow::Result<HostResponse> {
+/// succeeds. Execution is deferred, so there is nothing to inspect on
+/// success; a rejected registration (an ungranted or malformed undo) is the
+/// error.
+pub fn compensate(c: &Call) -> anyhow::Result<()> {
     let mut args = serde_json::json!({ "name": c.name });
     if let Some(call_args) = &c.args {
         args["args"] = call_args.clone();
     }
-    dispatch(&Call {
+    let response = dispatch(&Call {
         name: SYS_COMPENSATE.into(),
         args: Some(args),
-    })
+    })?;
+    if response.status == STATUS_FAILED {
+        anyhow::bail!("register compensation {:?}: {}", c.name, response.message);
+    }
+    Ok(())
 }
 
 /// abort rolls the open critical section back instead of finishing with
