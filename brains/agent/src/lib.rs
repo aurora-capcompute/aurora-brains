@@ -180,7 +180,9 @@ fn run_agent() -> anyhow::Result<()> {
             if let Some(idx) = first_abort_idx {
                 // The model gave up on the task and asked to roll it back: the
                 // host executes the compensations this run registered, newest
-                // first, then retries after the given delay or stops.
+                // first, then retries after the given delay or stops. Commit
+                // the turn first so no section is left open — a model abort
+                // rolls back (and retries) the whole task, not just this turn.
                 let reason = envelopes[idx]
                     .content
                     .get("reason")
@@ -191,6 +193,7 @@ fn run_agent() -> anyhow::Result<()> {
                     .content
                     .get("retry_seconds")
                     .and_then(|v| v.as_u64());
+                turn.commit()?;
                 return sdk::abort(&reason, retry);
             }
             if let Some(idx) = first_final_idx {
