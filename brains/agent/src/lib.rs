@@ -158,10 +158,26 @@ fn run_agent() -> anyhow::Result<()> {
         let envelopes = decode_model_envelopes(&chat)
             .map_err(|e| anyhow::anyhow!("invalid model JSON: {}", e))?;
 
-        let has_tool = envelopes.iter().any(|e| e.action != "final");
+        let has_tool = envelopes
+            .iter()
+            .any(|e| e.action != "final" && e.action != "abort");
         let first_final_idx = envelopes.iter().position(|e| e.action == "final");
+        let first_abort_idx = envelopes.iter().position(|e| e.action == "abort");
 
         if !has_tool {
+            if let Some(idx) = first_abort_idx {
+                // The model gave up on the task and asked to roll it back: the
+                // host unwinds this process's completed effects, compensating
+                // each capability that declares an inverse, instead of finishing
+                // with an answer.
+                let reason = envelopes[idx]
+                    .content
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return sdk::abort(&reason);
+            }
             if let Some(idx) = first_final_idx {
                 turn.commit()?;
                 return output_final(&envelopes[idx]);

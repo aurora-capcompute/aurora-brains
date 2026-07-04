@@ -45,6 +45,13 @@ pub const SYS_INPUT: &str = "sys.input";
 pub const SYS_OUTPUT: &str = "sys.output";
 pub const SYS_LOG: &str = "sys.log";
 
+/// Reserved name for rolling a process back: instead of finishing with
+/// [`output`], [`abort`] asks the host to unwind this process's completed
+/// effects (saga compensation — each capability's declared inverse, newest
+/// first). The forward counterpart of a crash resume: a host failure re-drives
+/// a run; sys.abort deliberately undoes it.
+pub const SYS_ABORT: &str = "sys.abort";
+
 /// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
 /// recoverable observations the brain can react to; "yield" never reaches the
 /// caller as a response (it surfaces as [`YieldedError`]), and "unspecified"
@@ -217,6 +224,20 @@ pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
     let args = serde_json::to_value(value).map_err(|e| anyhow::anyhow!("encode output: {}", e))?;
     dispatch(&Call {
         name: SYS_OUTPUT.into(),
+        args: Some(args),
+    })?;
+    Ok(())
+}
+
+/// abort rolls this process back with the sys.abort syscall instead of finishing
+/// with [`output`]: the host unwinds the process's completed effects, dispatching
+/// each capability's declared inverse newest-first. Call it when a task cannot be
+/// completed and its partial effects must be undone; the guest returns afterward
+/// and the run ends as compensated.
+pub fn abort(reason: &str) -> anyhow::Result<()> {
+    let args = serde_json::json!({ "reason": reason });
+    dispatch(&Call {
+        name: SYS_ABORT.into(),
         args: Some(args),
     })?;
     Ok(())
