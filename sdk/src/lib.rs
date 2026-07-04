@@ -57,6 +57,13 @@ pub const SYS_ABORT: &str = "sys.abort";
 /// compensations run — newest first — only if the section later aborts.
 pub const SYS_COMPENSATE: &str = "sys.compensate";
 
+/// Reserved names for the journaled world sources: the kernel pins the guest's
+/// ambient clock and RNG for determinism, so real time ([`now`]) and entropy
+/// ([`random`]) are syscalls — produced host-side on first execution, journaled,
+/// and replayed verbatim on resume.
+pub const SYS_NOW: &str = "sys.now";
+pub const SYS_RANDOM: &str = "sys.random";
+
 /// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
 /// recoverable observations the brain can react to; "yield" never reaches the
 /// caller as a response (it surfaces as [`YieldedError`]), and "unspecified"
@@ -273,6 +280,50 @@ pub fn abort(reason: &str, retry_seconds: Option<u64>) -> anyhow::Result<()> {
         args: Some(args),
     })?;
     Ok(())
+}
+
+/// now reads the host's wall clock in unix milliseconds. The value is journaled
+/// on first execution and replayed verbatim on resume, so it is safe anywhere in
+/// deterministic guest code — unlike an ambient clock, which the kernel pins.
+pub fn now() -> anyhow::Result<i64> {
+    let response = dispatch(&Call {
+        name: SYS_NOW.into(),
+        args: None,
+    })?;
+    if response.status != STATUS_RESULT {
+        anyhow::bail!("sys.now: {}", response.message);
+    }
+    response
+        .result
+        .as_ref()
+        .and_then(|v| v.get("unix_ms"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("sys.now: malformed payload"))
+}
+
+/// random draws `n` random bytes (1..=64). Journaled and replayed verbatim,
+/// like [`now`] — the deterministic source of jitter for guest-side backoff.
+pub fn random(n: usize) -> anyhow::Result<Vec<u8>> {
+    let response = dispatch(&Call {
+        name: SYS_RANDOM.into(),
+        args: Some(serde_json::json!({ "bytes": n })),
+    })?;
+    if response.status != STATUS_RESULT {
+        anyhow::bail!("sys.random: {}", response.message);
+    }
+    let hex = response
+        .result
+        .as_ref()
+        .and_then(|v| v.get("hex"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("sys.random: malformed payload"))?;
+    if hex.len() % 2 != 0 {
+        anyhow::bail!("sys.random: odd hex payload");
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(Into::into))
+        .collect()
 }
 
 /// log emits a human-readable progress line with the sys.log syscall. Logging is
