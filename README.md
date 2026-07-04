@@ -25,6 +25,16 @@ sdk/              aurora-brain-sdk — everything every brain needs:
 brains/
   agent/          the general-purpose agent: a tool-calling LLM loop over
                     whatever capabilities its manifest grants
+  camel/          the plan/execute split brain (CaMeL; Debenedetti et al.
+                    2025): the agent loop with the planner quarantined from
+                    tool output — results live guest-side as $1, $2, ...; the
+                    model sees only {action, status, var} stubs (failures: a
+                    generic marker + machine code, no error text) and routes
+                    data by writing "$N", substituted by the guest after the
+                    action is chosen. Injected tool output can name no new
+                    actions because the planner never reads it; limits: the
+                    args the model authors are still model-chosen, and the
+                    host's labels/capability policy remain the other half
   echo/           the smallest brain: no LLM, just input→output — the
                     multi-program path on the shared SDK
 ```

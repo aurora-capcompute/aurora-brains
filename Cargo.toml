@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["sdk", "brains/agent", "brains/echo"]
+members = ["sdk", "brains/agent", "brains/camel", "brains/echo"]
 
 # Every brain is one crate under brains/<name>/, compiled to wasm32-wasip1 as
 # a cdylib. New brain: copy brains/agent/Cargo.toml, depend on the sdk, write
