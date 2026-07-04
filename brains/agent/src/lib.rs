@@ -11,9 +11,11 @@ Use only the tools listed below. Match each tool's input JSON schema exactly.\n\
 You may request multiple independent tool calls in one turn. The host executes them sequentially and returns one aggregated observation array.\n\
 Each observation has status \"result\" with content or status \"failed\" with an error. A failed tool call is recoverable by default: use other sources, retry when appropriate, or explain the limitation.\n\
 Add \"hard\": true to a tool call only when its failure must abort the run so a later resume re-executes it (for example, a state-changing step the run cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
-After receiving observations, either request more tools or return exactly one final action:\n\
-{\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]}\n\
-Never combine a final action with tool calls in the same actions array.";
+To make a completed side effect undoable, register its exact inverse right after observing its result: {\"action\":\"compensate\",\"content\":{\"name\":\"<tool>\",\"args\":{...}}}. The host only records it; registered inverses run, newest first, if you later abort.\n\
+After receiving observations, either request more tools or return exactly one terminal action:\n\
+{\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish, or\n\
+{\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\",\"retry_seconds\":60}}]} to undo the registered effects and retry the task after the delay (omit retry_seconds to undo and stop).\n\
+Never combine a terminal action with tool calls in the same actions array.";
 
 // -- Data structures --
 
@@ -32,6 +34,10 @@ struct Input {
     system_prompt: String,
     #[serde(default)]
     capabilities: Vec<Capability>,
+    /// Which attempt this is (bumped by the host per retry) — lets the model
+    /// know earlier attempts were rolled back and back off accordingly.
+    #[serde(default)]
+    attempt: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -115,7 +121,13 @@ fn run_agent() -> anyhow::Result<()> {
         anyhow::bail!("message is required");
     }
 
-    let system_prompt = build_system_prompt(&inp.system_prompt, &inp.capabilities)?;
+    let mut system_prompt = build_system_prompt(&inp.system_prompt, &inp.capabilities)?;
+    if inp.attempt > 1 {
+        system_prompt.push_str(&format!(
+            "\nThis is attempt {} of this task; earlier attempts were rolled back.",
+            inp.attempt
+        ));
+    }
 
     let mut messages: Vec<Message> = Vec::with_capacity(inp.history.len() + 2);
     messages.push(Message {
@@ -167,16 +179,19 @@ fn run_agent() -> anyhow::Result<()> {
         if !has_tool {
             if let Some(idx) = first_abort_idx {
                 // The model gave up on the task and asked to roll it back: the
-                // host unwinds this process's completed effects, compensating
-                // each capability that declares an inverse, instead of finishing
-                // with an answer.
+                // host executes the compensations this run registered, newest
+                // first, then retries after the given delay or stops.
                 let reason = envelopes[idx]
                     .content
                     .get("reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                return sdk::abort(&reason);
+                let retry = envelopes[idx]
+                    .content
+                    .get("retry_seconds")
+                    .and_then(|v| v.as_u64());
+                return sdk::abort(&reason, retry);
             }
             if let Some(idx) = first_final_idx {
                 turn.commit()?;
@@ -194,7 +209,10 @@ fn run_agent() -> anyhow::Result<()> {
             if envelope.action == "final" {
                 continue;
             }
-            if !allowed.contains(envelope.action.as_str()) {
+            // "compensate" is protocol, not a menu tool: it registers a deferred
+            // undo with the host (validated there against the grant set).
+            let is_compensate = envelope.action == "compensate";
+            if !is_compensate && !allowed.contains(envelope.action.as_str()) {
                 anyhow::bail!(
                     "action {} requested unavailable capability {:?}",
                     i,
@@ -206,7 +224,11 @@ fn run_agent() -> anyhow::Result<()> {
             }
             emit_progress(&envelope.action, &envelope.content);
             let tool_call = Call {
-                name: envelope.action.clone(),
+                name: if is_compensate {
+                    sdk::SYS_COMPENSATE.into()
+                } else {
+                    envelope.action.clone()
+                },
                 args: Some(envelope.content.clone()),
             };
             let response = if envelope.hard {

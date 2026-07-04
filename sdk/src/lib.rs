@@ -45,12 +45,17 @@ pub const SYS_INPUT: &str = "sys.input";
 pub const SYS_OUTPUT: &str = "sys.output";
 pub const SYS_LOG: &str = "sys.log";
 
-/// Reserved name for rolling a process back: instead of finishing with
-/// [`output`], [`abort`] asks the host to unwind this process's completed
-/// effects (saga compensation — each capability's declared inverse, newest
-/// first). The forward counterpart of a crash resume: a host failure re-drives
-/// a run; sys.abort deliberately undoes it.
+/// Reserved name for rolling a critical section back: instead of finishing
+/// with [`output`], [`abort`] asks the host to execute the compensations the
+/// guest registered with [`compensate`], newest first, and then retry the
+/// section after a delay (or stop). The backward counterpart of a crash
+/// resume: a host failure re-drives a run; sys.abort deliberately undoes it.
 pub const SYS_ABORT: &str = "sys.abort";
+
+/// Reserved name for registering an effect's undo: a deferred syscall the host
+/// journals (name + concrete args) but does not execute. Registered
+/// compensations run — newest first — only if the section later aborts.
+pub const SYS_COMPENSATE: &str = "sys.compensate";
 
 /// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
 /// recoverable observations the brain can react to; "yield" never reaches the
@@ -229,13 +234,31 @@ pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// abort rolls this process back with the sys.abort syscall instead of finishing
-/// with [`output`]: the host unwinds the process's completed effects, dispatching
-/// each capability's declared inverse newest-first. Call it when a task cannot be
-/// completed and its partial effects must be undone; the guest returns afterward
-/// and the run ends as compensated.
-pub fn abort(reason: &str) -> anyhow::Result<()> {
-    let args = serde_json::json!({ "reason": reason });
+/// compensate registers an effect's undo, to run only if the section later
+/// aborts: `name` is the granted capability to dispatch and `args` its exact
+/// arguments — built from the effect's result (e.g. the charge id a refund
+/// needs), so the undo is concrete, not generic. Register immediately after
+/// the effect succeeds. The host validates the name against the grant set and
+/// journals the deferred call; a rejected registration comes back as a failed
+/// response.
+pub fn compensate(name: &str, args: Value) -> anyhow::Result<HostResponse> {
+    dispatch(&Call {
+        name: SYS_COMPENSATE.into(),
+        args: Some(serde_json::json!({ "name": name, "args": args })),
+    })
+}
+
+/// abort rolls the open critical section back instead of finishing with
+/// [`output`]: the host executes the compensations registered with
+/// [`compensate`] newest-first, journaling each. With `retry_seconds` the
+/// section then retries after that delay — the journal forks at the section's
+/// begin and the whole section re-executes fresh; without it the process stops
+/// as compensated. The guest returns after calling abort.
+pub fn abort(reason: &str, retry_seconds: Option<u64>) -> anyhow::Result<()> {
+    let mut args = serde_json::json!({ "reason": reason });
+    if let Some(delay) = retry_seconds {
+        args["retry_seconds"] = delay.into();
+    }
     dispatch(&Call {
         name: SYS_ABORT.into(),
         args: Some(args),
@@ -257,9 +280,10 @@ pub fn log(message: &str) {
 /// Capability is one tool the host has granted this run — the guest's decoded
 /// view of capcompute's `sys.Capability`. A brain reads `name`/`description`/
 /// `input_schema` to build its tool menu, and may consult `hidden` (keep a
-/// dispatchable tool off that menu), `labels`/`forbid` (the provenance a result
-/// carries and the labels barred from its args), and `compensation` (saga undo)
-/// to shape or gate the menu. Decode-only: the host owns the record.
+/// dispatchable tool off that menu) and `labels`/`forbid` (the provenance a
+/// result carries and the labels barred from its args). Decode-only: the host
+/// owns the record. How an effect is undone is not capability metadata — the
+/// guest registers concrete undos with [`compensate`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Capability {
     pub name: String,
@@ -270,27 +294,10 @@ pub struct Capability {
     /// Dispatchable, but excluded from the brain's discoverable tool menu.
     #[serde(default)]
     pub hidden: bool,
-    /// How a completed effect of this capability is undone when a scope aborts.
-    #[serde(default)]
-    pub compensation: Compensation,
     /// Source classes this capability's results carry (taint labels).
     #[serde(default)]
     pub labels: Vec<String>,
     /// Labels that may not flow into this capability's args.
     #[serde(default)]
     pub forbid: Vec<String>,
-}
-
-/// Compensation declares how to undo a completed effect of a [`Capability`]
-/// (saga compensation). The default — an empty `kind` — escalates: the effect is
-/// assumed irreversible and unwinding surfaces it to a human.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Compensation {
-    /// "none" (read-only), "syscall" (dispatch the inverse named below), or
-    /// "escalate"/"" (irreversible).
-    #[serde(default)]
-    pub kind: String,
-    /// The inverse capability to dispatch when `kind` is "syscall".
-    #[serde(default)]
-    pub syscall: String,
 }
