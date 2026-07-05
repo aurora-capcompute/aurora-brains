@@ -168,9 +168,12 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
 
 /// A Savepoint brackets a critical zone in a sys.begin/sys.commit pair. Open one
 /// with [`savepoint`] and close it with [`Savepoint::commit`] once the zone has
-/// succeeded; *dropping it without committing* leaves the sys.begin open, and a
-/// run that then fails aborts the zone: the host executes the compensations
-/// registered inside it ([`compensate`]) newest-first before the run reports
+/// succeeded; *dropping it without committing* leaves the sys.begin open. A run
+/// that then fails is first re-driven by replay — a transient failure simply
+/// resumes and continues, and any [`compensate`] registration the failure cut
+/// short lands on the re-drive (registering an undo right after its effect is
+/// safe). A failure that re-drives without progress aborts the zone: the host
+/// executes the registered compensations newest-first before the run reports
 /// failed, and a retry forks right after the begin — re-executing the whole
 /// zone live, over rolled-back state. That drop-aborts behavior is the point —
 /// propagate an error out of the zone (with `?`) and the savepoint unwinds the
@@ -204,9 +207,10 @@ pub fn savepoint() -> anyhow::Result<Savepoint> {
 
 /// dispatch_hard brackets a single call in a [`savepoint`]. On success it commits
 /// and returns the result. On failure it leaves the begin open and returns an
-/// error that aborts the run — the section rolls back (any registered
-/// compensations run) and a retry forks right after the begin, re-executing the
-/// call under a new revision. A plain [`dispatch`] (the default, "soft") instead
+/// error that fails the run — a transient failure re-drives and re-executes the
+/// call; a deterministic one rolls the section back (any registered
+/// compensations run) and a retry forks right after the begin, re-executing
+/// under a new revision. A plain [`dispatch`] (the default, "soft") instead
 /// records the failure for replay and lets the brain react to it.
 pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
     let sp = savepoint()?;
