@@ -168,11 +168,14 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
 
 /// A Savepoint brackets a critical zone in a sys.begin/sys.commit pair. Open one
 /// with [`savepoint`] and close it with [`Savepoint::commit`] once the zone has
-/// succeeded; *dropping it without committing* leaves the sys.begin open, so a
-/// resumed run forks right after it and re-executes the whole zone live. That
-/// drop-aborts behavior is the point — propagate an error out of the zone (with
-/// `?`) and the savepoint unwinds the run for you. Brackets have stack
-/// semantics; [`dispatch_hard`] wraps a single call this way.
+/// succeeded; *dropping it without committing* leaves the sys.begin open, and a
+/// run that then fails aborts the zone: the host executes the compensations
+/// registered inside it ([`compensate`]) newest-first before the run reports
+/// failed, and a retry forks right after the begin — re-executing the whole
+/// zone live, over rolled-back state. That drop-aborts behavior is the point —
+/// propagate an error out of the zone (with `?`) and the savepoint unwinds the
+/// run for you. Brackets have stack semantics; [`dispatch_hard`] wraps a single
+/// call this way.
 #[must_use = "a Savepoint aborts the run unless it is committed"]
 #[non_exhaustive]
 pub struct Savepoint {}
@@ -201,9 +204,10 @@ pub fn savepoint() -> anyhow::Result<Savepoint> {
 
 /// dispatch_hard brackets a single call in a [`savepoint`]. On success it commits
 /// and returns the result. On failure it leaves the begin open and returns an
-/// error that aborts the run, so a later resume forks right after the begin and
-/// re-executes the call under a new revision. A plain [`dispatch`] (the default,
-/// "soft") instead records the failure for replay and lets the brain react to it.
+/// error that aborts the run — the section rolls back (any registered
+/// compensations run) and a retry forks right after the begin, re-executing the
+/// call under a new revision. A plain [`dispatch`] (the default, "soft") instead
+/// records the failure for replay and lets the brain react to it.
 pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
     let sp = savepoint()?;
     let response = dispatch(c)?;
