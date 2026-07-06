@@ -22,7 +22,7 @@ struct Answer {
     answer: String,
 }
 
-/// The entrypoint's return envelope: the run's terminal status, all the host
+/// The entrypoint's return envelope: the process's terminal status, all the host
 /// reads from a guest's return. The answer itself travels through sys.output.
 #[derive(Serialize)]
 struct Output {

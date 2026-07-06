@@ -5,7 +5,7 @@
 //! [`savepoint`]s, and savepoint-bracketed "hard" calls ([`dispatch_hard`]).
 //!
 //! On top of that it owns the typed plumbing a brain would otherwise
-//! re-implement by hand: [`input`]/[`output`] for the run's payloads, [`log`]
+//! re-implement by hand: [`input`]/[`output`] for the process's payloads, [`log`]
 //! for progress, and the decoded [`Capability`] menu the host grants. What is
 //! left for the brain is cognition.
 //!
@@ -49,7 +49,7 @@ pub const SYS_LOG: &str = "sys.log";
 /// with [`output`], [`abort`] asks the host to execute the compensations the
 /// guest registered with [`compensate`], newest first, and then retry the
 /// section after a delay (or stop). The backward counterpart of a crash
-/// resume: a host failure re-drives a run; sys.abort deliberately undoes it.
+/// resume: a host failure re-drives a process; sys.abort deliberately undoes it.
 pub const SYS_ABORT: &str = "sys.abort";
 
 /// Reserved name for registering an effect's undo: a deferred syscall the host
@@ -76,7 +76,7 @@ pub const STATUS_UNSPECIFIED: &str = "unspecified";
 
 /// YieldedError is the yield sentinel: the host parked this run on external
 /// work (an approval, a timer, a message). Bubble it up and return
-/// `{"status":"yielded"}` from the entrypoint; the run resumes by replay.
+/// `{"status":"yielded"}` from the entrypoint; the process resumes by replay.
 #[derive(Debug)]
 pub struct YieldedError;
 
@@ -173,13 +173,13 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
 /// resumes and continues, and any [`compensate`] registration the failure cut
 /// short lands on the re-drive (registering an undo right after its effect is
 /// safe). A failure that re-drives without progress aborts the zone: the host
-/// executes the registered compensations newest-first before the run reports
+/// executes the registered compensations newest-first before the process reports
 /// failed, and a retry forks right after the begin — re-executing the whole
 /// zone live, over rolled-back state. That drop-aborts behavior is the point —
 /// propagate an error out of the zone (with `?`) and the savepoint unwinds the
 /// run for you. Brackets have stack semantics; [`dispatch_hard`] wraps a single
 /// call this way.
-#[must_use = "a Savepoint aborts the run unless it is committed"]
+#[must_use = "a Savepoint aborts the process unless it is committed"]
 #[non_exhaustive]
 pub struct Savepoint {}
 
@@ -207,7 +207,7 @@ pub fn savepoint() -> anyhow::Result<Savepoint> {
 
 /// dispatch_hard brackets a single call in a [`savepoint`]. On success it commits
 /// and returns the result. On failure it leaves the begin open and returns an
-/// error that fails the run — a transient failure re-drives and re-executes the
+/// error that fails the process — a transient failure re-drives and re-executes the
 /// call; a deterministic one rolls the section back (any registered
 /// compensations run) and a retry forks right after the begin, re-executing
 /// under a new revision. A plain [`dispatch`] (the default, "soft") instead
@@ -336,7 +336,7 @@ pub fn random(n: usize) -> anyhow::Result<Vec<u8>> {
 
 /// log emits a human-readable progress line with the sys.log syscall. Logging is
 /// best-effort observability: any failure (or a host yield) is swallowed so it
-/// never perturbs the run.
+/// never perturbs the process.
 pub fn log(message: &str) {
     let args = serde_json::json!({ "message": message });
     let _ = dispatch(&Call {

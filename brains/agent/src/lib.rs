@@ -10,7 +10,7 @@ The host owns all side effects. Reply with exactly one compact JSON object conta
 Use only the tools listed below. Match each tool's input JSON schema exactly.\n\
 You may request multiple independent tool calls in one turn. The host executes them sequentially and returns one aggregated observation array.\n\
 Each observation has status \"result\" with content or status \"failed\" with an error. A failed tool call is recoverable by default: use other sources, retry when appropriate, or explain the limitation.\n\
-Add \"hard\": true to a tool call only when its failure must abort the run so a later resume re-executes it (for example, a state-changing step the run cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
+Add \"hard\": true to a tool call only when its failure must abort the process so a later resume re-executes it (for example, a state-changing step the process cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
 To make a completed side effect undoable, register its exact inverse right after observing its result: {\"action\":\"compensate\",\"content\":{\"name\":\"<tool>\",\"args\":{...}}}. The host only records it; registered inverses run, newest first, if you later abort.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish, or\n\
@@ -70,7 +70,7 @@ struct LlmChoiceMessage {
 struct ModelEnvelope {
     action: String,
     content: Value,
-    // `hard` marks a call whose failure must abort the run (with its savepoint
+    // `hard` marks a call whose failure must abort the process (with its savepoint
     // left open) so a later resume re-executes it, instead of being reported back
     // as a recoverable observation. Default is the soft path.
     hard: bool,

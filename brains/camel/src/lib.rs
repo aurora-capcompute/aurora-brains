@@ -35,7 +35,7 @@ You may request multiple independent tool calls in one turn. The host executes t
 You never see tool output. A successful call's result is stored as a guest-side variable and its observation is {\"action\":...,\"status\":\"result\",\"var\":\"$N\"}. A failed call's observation is {\"action\":...,\"status\":\"failed\",\"error\":\"failed\"}, plus a short machine \"code\" when one exists; error text is withheld. Plan from what you requested and where it came from, never from result content you expect to read.\n\
 To use a stored result, write the literal string \"$N\" inside a later tool call's string arguments or in your final answer; the executor substitutes the stored value after you have chosen the action. A string that is exactly \"$N\" becomes the stored JSON value itself; \"$N\" inside a longer string becomes its text rendering (strings verbatim, other values compact JSON). Write \"$$\" for a literal \"$\". Referencing a variable that does not exist fails the turn.\n\
 A failed tool call is recoverable by default: use other sources, retry when appropriate, or explain the limitation.\n\
-Add \"hard\": true to a tool call only when its failure must abort the run so a later resume re-executes it (for example, a state-changing step the run cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
+Add \"hard\": true to a tool call only when its failure must abort the process so a later resume re-executes it (for example, a state-changing step the process cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
 To make a completed side effect undoable, register its exact inverse right after observing its result: {\"action\":\"compensate\",\"content\":{\"name\":\"<tool>\",\"args\":{...}}}; the args may reference $N, the name may not. The host only records it; registered inverses run, newest first, if you later abort.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish — the answer may reference $N and is substituted before delivery, or\n\
@@ -94,7 +94,7 @@ struct LlmChoiceMessage {
 struct ModelEnvelope {
     action: String,
     content: Value,
-    // `hard` marks a call whose failure must abort the run (with its savepoint
+    // `hard` marks a call whose failure must abort the process (with its savepoint
     // left open) so a later resume re-executes it, instead of being reported back
     // as a recoverable observation. Default is the soft path.
     hard: bool,
