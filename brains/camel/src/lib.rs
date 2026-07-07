@@ -107,6 +107,19 @@ struct FinishArgs {
 
 // -- Entry point --
 
+/// The program's bundled interface: what to pass and what comes back.
+#[plugin_fn]
+pub fn describe(_: ()) -> FnResult<Json<sdk::Interface>> {
+    Ok(Json(sdk::Interface {
+        description: "The prompt-injection-resilient plan/execute agent (after CaMeL): the \
+                      planning model never reads raw tool output — results live in a quarantined \
+                      variable store and flow by reference."
+            .into(),
+        input: serde_json::json!({"type": "string", "description": "The task, in natural language."}),
+        output: serde_json::json!({"type": "string", "description": "The final answer; quarantined variables are substituted before delivery."}),
+    }))
+}
+
 #[plugin_fn]
 pub fn run(_: ()) -> FnResult<Json<Output>> {
     match run_camel() {

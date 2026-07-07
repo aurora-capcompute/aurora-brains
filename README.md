@@ -41,6 +41,20 @@ brains/
 
 A brain crate contains only cognition; the boundary lives in the SDK.
 
+## A program describes itself
+
+Every brain exports a second, pure entrypoint next to `run`: `describe`, which
+returns an `sdk::Interface` — a one-line `description` plus JSON Schemas for the
+process's input `message` and its answer `output`. Conversational brains declare
+`{"type":"string"}`; a structured program declares object schemas and callers
+pass/receive JSON text. The host extracts the interface at registration (a pure
+instantiation with syscalls stubbed out — a program that dispatches during
+`describe` fails to register), so it travels inside the wasm and the program's
+content digest covers it. From there the host publishes it to callers (the
+`sys.spawn` menu a parent LLM reads, the program directory a user lists) and
+validates every input message and answer against the schemas. That is how a
+caller — model or human — knows what to pass a program without reading its code.
+
 ## Building a brain
 
 ```sh
@@ -62,7 +76,9 @@ See `brains/echo` for the smallest possible brain — input→output with no LLM
    cognition, report the result with `sdk::output` (and `sdk::log` for
    progress), and export the entrypoint with `#[plugin_fn]`. Return
    `{"status":"completed"}` or bubble the yield sentinel (`sdk::yielded`) up
-   and return `{"status":"yielded"}`.
+   and return `{"status":"yielded"}`. Also export a pure `describe`
+   (`#[plugin_fn]`) returning `sdk::Interface` — the program's description and
+   input/output schemas (see `brains/echo` for the minimal shape).
 4. Keep the brain deterministic: no clocks, no randomness, no I/O outside the
    SDK's syscalls — the kernel pins the ambient sources and the journal
    replays the rest.

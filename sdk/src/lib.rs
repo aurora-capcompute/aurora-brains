@@ -240,12 +240,18 @@ pub fn input<T: DeserializeOwned>() -> anyhow::Result<T> {
 }
 
 /// output publishes this run's result payload with the sys.output syscall.
+/// The host validates the answer against the program's declared output schema
+/// (see [`Interface`]); a rejected answer comes back as an error the brain can
+/// react to — correct the answer and publish again.
 pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
     let args = serde_json::to_value(value).map_err(|e| anyhow::anyhow!("encode output: {}", e))?;
-    dispatch(&Call {
+    let response = dispatch(&Call {
         name: SYS_OUTPUT.into(),
         args: Some(args),
     })?;
+    if response.status == STATUS_FAILED {
+        anyhow::bail!("publish output: {}", response.message);
+    }
     Ok(())
 }
 
@@ -343,6 +349,35 @@ pub fn log(message: &str) {
         name: SYS_LOG.into(),
         args: Some(args),
     });
+}
+
+/// Interface is a program's self-description, returned by its `describe`
+/// export — the second entrypoint every brain exports next to `run`:
+///
+/// ```ignore
+/// #[plugin_fn]
+/// pub fn describe(_: ()) -> FnResult<Json<sdk::Interface>> {
+///     Ok(Json(sdk::Interface {
+///         description: "What this program does.".into(),
+///         input: serde_json::json!({"type": "string"}),
+///         output: serde_json::json!({"type": "string"}),
+///     }))
+/// }
+/// ```
+///
+/// `input` is the JSON Schema of the process's input message and `output` the
+/// schema of its answer; conversational brains declare `{"type":"string"}`,
+/// structured programs declare object schemas and callers pass/receive JSON
+/// text. The interface travels inside the wasm, so the program's content
+/// digest covers it. `describe` must be pure: the host extracts it at
+/// registration with no syscalls available, refuses programs that cannot
+/// describe themselves, publishes the interface to callers (the spawn menu, the
+/// program directory), and validates messages and answers against the schemas.
+#[derive(Serialize)]
+pub struct Interface {
+    pub description: String,
+    pub input: Value,
+    pub output: Value,
 }
 
 /// Capability is one tool the host has granted this run — the guest's decoded

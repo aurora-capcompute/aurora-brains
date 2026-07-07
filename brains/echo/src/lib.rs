@@ -49,3 +49,15 @@ fn echo() -> anyhow::Result<()> {
     };
     sdk::output(&Answer { answer })
 }
+
+/// The program's bundled interface: what to pass and what comes back.
+#[plugin_fn]
+pub fn describe(_: ()) -> FnResult<Json<sdk::Interface>> {
+    Ok(Json(sdk::Interface {
+        description: "Echoes the message back; answers \"pong\" when the message is empty. \
+                      Needs no LLM and no capabilities."
+            .into(),
+        input: serde_json::json!({"type": "string", "description": "The text to echo."}),
+        output: serde_json::json!({"type": "string", "description": "The message verbatim, or \"pong\"."}),
+    }))
+}

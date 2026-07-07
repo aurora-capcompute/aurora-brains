@@ -100,6 +100,18 @@ struct FinishArgs {
 
 // -- Entry point --
 
+/// The program's bundled interface: what to pass and what comes back.
+#[plugin_fn]
+pub fn describe(_: ()) -> FnResult<Json<sdk::Interface>> {
+    Ok(Json(sdk::Interface {
+        description: "A general agent: plans with an LLM and drives its granted capabilities \
+                      until the task is done, undoable effects registered along the way."
+            .into(),
+        input: serde_json::json!({"type": "string", "description": "The task, in natural language."}),
+        output: serde_json::json!({"type": "string", "description": "The final answer, in natural language."}),
+    }))
+}
+
 #[plugin_fn]
 pub fn run(_: ()) -> FnResult<Json<Output>> {
     match run_agent() {
