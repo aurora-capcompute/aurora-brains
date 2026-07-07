@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["sdk", "brains/agent", "brains/camel", "brains/echo"]
+members = ["sdk", "programs/agent", "programs/camel", "programs/echo"]
 
-# Every brain is one crate under brains/<name>/, compiled to wasm32-wasip1 as
-# a cdylib. New brain: copy brains/agent/Cargo.toml, depend on the sdk, write
-# src/lib.rs, add the member here.
+# Every program is one crate under programs/<name>/, compiled to wasm32-wasip1
+# as a cdylib. New program: copy programs/echo/Cargo.toml, depend on the sdk,
+# write src/lib.rs and interface.json, add the member here.
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
-aurora-brain-sdk = { path = "sdk" }
+aurora-program-sdk = { path = "sdk" }
 anyhow = "1"
 extism-pdk = "1"
 serde = { version = "1", features = ["derive"] }

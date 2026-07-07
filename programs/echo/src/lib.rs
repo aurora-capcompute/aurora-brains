@@ -1,11 +1,11 @@
-//! echo — the smallest possible Aurora brain. It reads its input through the
+//! echo — the smallest possible Aurora program. It reads its input through the
 //! SDK, needs no LLM and no capabilities, and returns a deterministic answer:
 //! the message it was given, or "pong" when none was. It exists to exercise the
-//! multi-program path and to show how little a brain is once the SDK owns the
+//! multi-program path and to show how little a program is once the SDK owns the
 //! protocol — cognition here is a single `if`, and the plumbing is just
 //! [`sdk::input`] → [`sdk::output`].
 
-use aurora_brain_sdk as sdk;
+use aurora_program_sdk as sdk;
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +16,7 @@ struct Input {
 }
 
 /// The run's result payload, published via sys.output — the same `{"answer":
-/// ...}` shape the agent brain reports.
+/// ...}` shape the agent program reports.
 #[derive(Serialize)]
 struct Answer {
     answer: String,
@@ -48,16 +48,4 @@ fn echo() -> anyhow::Result<()> {
         input.message
     };
     sdk::output(&Answer { answer })
-}
-
-/// The program's bundled interface: what to pass and what comes back.
-#[plugin_fn]
-pub fn describe(_: ()) -> FnResult<Json<sdk::Interface>> {
-    Ok(Json(sdk::Interface {
-        description: "Echoes the message back; answers \"pong\" when the message is empty. \
-                      Needs no LLM and no capabilities."
-            .into(),
-        input: serde_json::json!({"type": "string", "description": "The text to echo."}),
-        output: serde_json::json!({"type": "string", "description": "The message verbatim, or \"pong\"."}),
-    }))
 }

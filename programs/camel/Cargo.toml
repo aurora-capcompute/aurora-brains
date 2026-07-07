@@ -1,0 +1,15 @@
+[package]
+name = "camel"
+description = "The plan/execute program (CaMeL): the planning LLM never reads tool output — results are quarantined guest-side as $N variables and substituted into later calls only after the action is chosen, so injected text in a result can never steer the plan."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aurora-program-sdk.workspace = true
+anyhow.workspace = true
+extism-pdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true

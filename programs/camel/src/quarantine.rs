@@ -1,11 +1,11 @@
-//! The quarantine: this brain's guest-side variable store and the two pure
+//! The quarantine: this program's guest-side variable store and the two pure
 //! halves of its contract with the planning model — stub observations (all
 //! the model is ever told about an executed call) and `$N` substitution (how
 //! data the model cannot read still flows into the calls it authors). Raw
 //! tool output enters the store and leaves only through substitution; it
 //! never crosses into the model's conversation.
 
-use aurora_brain_sdk as sdk;
+use aurora_program_sdk as sdk;
 use serde::Serialize;
 use serde_json::Value;
 

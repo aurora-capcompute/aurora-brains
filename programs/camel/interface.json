@@ -1,0 +1,11 @@
+{
+  "description": "The prompt-injection-resilient plan/execute agent (after CaMeL): the planning model never reads raw tool output — results live in a quarantined variable store and flow by reference.",
+  "input": {
+    "type": "string",
+    "description": "The task, in natural language."
+  },
+  "output": {
+    "type": "string",
+    "description": "The final answer; quarantined variables are substituted before delivery."
+  }
+}

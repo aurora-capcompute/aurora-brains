@@ -1,0 +1,11 @@
+{
+  "description": "Echoes the message back; answers \"pong\" when the message is empty. Needs no LLM and no capabilities.",
+  "input": {
+    "type": "string",
+    "description": "The text to echo."
+  },
+  "output": {
+    "type": "string",
+    "description": "The message verbatim, or \"pong\"."
+  }
+}

@@ -1,0 +1,14 @@
+[package]
+name = "echo"
+description = "The smallest Aurora program: no LLM, no capabilities — it reads its input and echoes back a deterministic answer, exercising the SDK's input→output plumbing."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aurora-program-sdk.workspace = true
+anyhow.workspace = true
+extism-pdk.workspace = true
+serde.workspace = true

@@ -1,16 +1,19 @@
-//! The Aurora brain SDK: everything a guest brain needs to speak the syscall
-//! boundary, so a brain crate contains only cognition. It owns the ABI v3
-//! wire codec ([`wire`]), the single `extism:host/compute` syscall import, and
-//! the dispatch protocol — result/failed observations, the yield sentinel,
-//! [`savepoint`]s, and savepoint-bracketed "hard" calls ([`dispatch_hard`]).
+//! The Aurora program SDK: everything a guest program needs to speak the
+//! syscall boundary, so a program crate contains only cognition. It owns the
+//! ABI v3 wire codec ([`wire`]), the single `extism:host/compute` syscall
+//! import, and the dispatch protocol — result/failed observations, the yield
+//! sentinel, [`savepoint`]s, and savepoint-bracketed "hard" calls
+//! ([`dispatch_hard`]).
 //!
-//! On top of that it owns the typed plumbing a brain would otherwise
+//! On top of that it owns the typed plumbing a program would otherwise
 //! re-implement by hand: [`input`]/[`output`] for the process's payloads, [`log`]
 //! for progress, and the decoded [`Capability`] menu the host grants. What is
-//! left for the brain is cognition.
+//! left for the program is cognition.
 //!
-//! A brain is one cdylib crate under `brains/<name>/` that depends on this
-//! SDK and exports its entrypoint with `#[plugin_fn]`.
+//! A program is one cdylib crate under `programs/<name>/` that depends on this
+//! SDK and exports its entrypoint with `#[plugin_fn]`. It ships with an
+//! `interface.json` manifest — its description and input/output JSON Schemas —
+//! that the host loads alongside the wasm.
 
 use extism_pdk::Memory;
 use serde::de::DeserializeOwned;
@@ -65,7 +68,7 @@ pub const SYS_NOW: &str = "sys.now";
 pub const SYS_RANDOM: &str = "sys.random";
 
 /// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
-/// recoverable observations the brain can react to; "yield" never reaches the
+/// recoverable observations the program can react to; "yield" never reaches the
 /// caller as a response (it surfaces as [`YieldedError`]), and "unspecified"
 /// covers a status the host left unset. These are the decoded-string mirror of
 /// the wire status codes ([`wire::STATUS_RESULT`] and friends).
@@ -100,7 +103,7 @@ pub struct Call {
     pub args: Option<Value>,
 }
 
-/// HostResponse is the brain's view of a syscall outcome with the JSON result
+/// HostResponse is the program's view of a syscall outcome with the JSON result
 /// payload already parsed. Status is "result" or "failed" — a yield never
 /// reaches the caller as a response (see [`YieldedError`]).
 pub struct HostResponse {
@@ -115,7 +118,7 @@ pub struct HostResponse {
 }
 
 /// dispatch sends one syscall and returns its outcome. Failures come back as
-/// a response with status "failed" (recoverable by default: the brain can
+/// a response with status "failed" (recoverable by default: the program can
 /// react); a host yield is surfaced as [`YieldedError`].
 pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
     let args = match &c.args {
@@ -211,7 +214,7 @@ pub fn savepoint() -> anyhow::Result<Savepoint> {
 /// call; a deterministic one rolls the section back (any registered
 /// compensations run) and a retry forks right after the begin, re-executing
 /// under a new revision. A plain [`dispatch`] (the default, "soft") instead
-/// records the failure for replay and lets the brain react to it.
+/// records the failure for replay and lets the program react to it.
 pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
     let sp = savepoint()?;
     let response = dispatch(c)?;
@@ -223,7 +226,7 @@ pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
 }
 
 /// input fetches this run's input payload with the sys.input syscall and
-/// deserializes it into `T` — the typed front door a brain uses instead of
+/// deserializes it into `T` — the typed front door a program uses instead of
 /// dispatching sys.input by hand.
 pub fn input<T: DeserializeOwned>() -> anyhow::Result<T> {
     let response = dispatch(&Call {
@@ -241,8 +244,8 @@ pub fn input<T: DeserializeOwned>() -> anyhow::Result<T> {
 
 /// output publishes this run's result payload with the sys.output syscall.
 /// The host validates the answer against the program's declared output schema
-/// (see [`Interface`]); a rejected answer comes back as an error the brain can
-/// react to — correct the answer and publish again.
+/// (its `interface.json` manifest); a rejected answer comes back as an error
+/// the program can react to — correct the answer and publish again.
 pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
     let args = serde_json::to_value(value).map_err(|e| anyhow::anyhow!("encode output: {}", e))?;
     let response = dispatch(&Call {
@@ -351,37 +354,8 @@ pub fn log(message: &str) {
     });
 }
 
-/// Interface is a program's self-description, returned by its `describe`
-/// export — the second entrypoint every brain exports next to `run`:
-///
-/// ```ignore
-/// #[plugin_fn]
-/// pub fn describe(_: ()) -> FnResult<Json<sdk::Interface>> {
-///     Ok(Json(sdk::Interface {
-///         description: "What this program does.".into(),
-///         input: serde_json::json!({"type": "string"}),
-///         output: serde_json::json!({"type": "string"}),
-///     }))
-/// }
-/// ```
-///
-/// `input` is the JSON Schema of the process's input message and `output` the
-/// schema of its answer; conversational brains declare `{"type":"string"}`,
-/// structured programs declare object schemas and callers pass/receive JSON
-/// text. The interface travels inside the wasm, so the program's content
-/// digest covers it. `describe` must be pure: the host extracts it at
-/// registration with no syscalls available, refuses programs that cannot
-/// describe themselves, publishes the interface to callers (the spawn menu, the
-/// program directory), and validates messages and answers against the schemas.
-#[derive(Serialize)]
-pub struct Interface {
-    pub description: String,
-    pub input: Value,
-    pub output: Value,
-}
-
 /// Capability is one tool the host has granted this run — the guest's decoded
-/// view of capcompute's `sys.Capability`. A brain reads `name`/`description`/
+/// view of capcompute's `sys.Capability`. A program reads `name`/`description`/
 /// `input_schema` to build its tool menu, and may consult `hidden` (keep a
 /// dispatchable tool off that menu) and `labels`/`forbid` (the provenance a
 /// result carries and the labels barred from its args). Decode-only: the host
@@ -394,7 +368,7 @@ pub struct Capability {
     pub description: String,
     #[serde(default)]
     pub input_schema: Value,
-    /// Dispatchable, but excluded from the brain's discoverable tool menu.
+    /// Dispatchable, but excluded from the program's discoverable tool menu.
     #[serde(default)]
     pub hidden: bool,
     /// Source classes this capability's results carry (taint labels).

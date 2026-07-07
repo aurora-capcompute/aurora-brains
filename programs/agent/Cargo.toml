@@ -1,5 +1,5 @@
 [package]
-name = "agent-brain"
+name = "agent"
 description = "The general-purpose Aurora agent: a tool-calling LLM loop over the capabilities its manifest grants."
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ edition.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-aurora-brain-sdk.workspace = true
+aurora-program-sdk.workspace = true
 anyhow.workspace = true
 extism-pdk.workspace = true
 serde.workspace = true

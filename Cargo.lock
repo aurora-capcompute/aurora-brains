@@ -3,11 +3,11 @@
 version = 4
 
 [[package]]
-name = "agent-brain"
+name = "agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aurora-brain-sdk",
+ "aurora-program-sdk",
  "extism-pdk",
  "serde",
  "serde_json",
@@ -20,7 +20,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
-name = "aurora-brain-sdk"
+name = "aurora-program-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -54,25 +54,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
-name = "camel-brain"
+name = "camel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aurora-brain-sdk",
+ "aurora-program-sdk",
  "extism-pdk",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "echo-brain"
+name = "echo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aurora-brain-sdk",
+ "aurora-program-sdk",
  "extism-pdk",
  "serde",
- "serde_json",
 ]
 
 [[package]]

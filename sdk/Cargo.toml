@@ -1,6 +1,6 @@
 [package]
-name = "aurora-brain-sdk"
-description = "Everything an Aurora brain needs to speak the syscall boundary: the ABI v3 wire codec and the dispatch protocol (yield, savepoints, hard calls)."
+name = "aurora-program-sdk"
+description = "Everything an Aurora program needs to speak the syscall boundary: the ABI v3 wire codec and the dispatch protocol (yield, savepoints, hard calls)."
 version.workspace = true
 edition.workspace = true
 

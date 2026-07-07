@@ -1,9 +1,9 @@
-//! camel — the plan/execute split brain: the agent loop made
+//! camel — the plan/execute split program: the agent loop made
 //! prompt-injection-resilient after CaMeL (Debenedetti et al. 2025,
 //! "Defeating Prompt Injections by Design") and Willison's dual-LLM pattern.
 //!
 //! The kernel already mediates every capability and tracks data-flow labels
-//! host-side. This brain supplies the missing guest half: the planning model
+//! host-side. This program supplies the missing guest half: the planning model
 //! NEVER reads raw tool output. Each successful call's result is held in a
 //! guest-side variable store ([`quarantine`]) as `$1`, `$2`, ...; the model
 //! receives only a stub observation `{action, status, var}` — a failure is a
@@ -14,12 +14,12 @@
 //! action. Injected text inside a tool result can therefore never name the
 //! next action — it is data in a store, not words in the planner's context.
 //!
-//! Everything else mirrors `brains/agent`: the same conversation/action
+//! Everything else mirrors `programs/agent`: the same conversation/action
 //! protocol, per-turn savepoints, hard calls, compensation registration, and
 //! terminal final/abort actions.
 
-use aurora_brain_sdk as sdk;
-use aurora_brain_sdk::{Call, Capability};
+use aurora_program_sdk as sdk;
+use aurora_program_sdk::{Call, Capability};
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -107,19 +107,6 @@ struct FinishArgs {
 
 // -- Entry point --
 
-/// The program's bundled interface: what to pass and what comes back.
-#[plugin_fn]
-pub fn describe(_: ()) -> FnResult<Json<sdk::Interface>> {
-    Ok(Json(sdk::Interface {
-        description: "The prompt-injection-resilient plan/execute agent (after CaMeL): the \
-                      planning model never reads raw tool output — results live in a quarantined \
-                      variable store and flow by reference."
-            .into(),
-        input: serde_json::json!({"type": "string", "description": "The task, in natural language."}),
-        output: serde_json::json!({"type": "string", "description": "The final answer; quarantined variables are substituted before delivery."}),
-    }))
-}
-
 #[plugin_fn]
 pub fn run(_: ()) -> FnResult<Json<Output>> {
     match run_camel() {
@@ -151,7 +138,7 @@ fn run_camel() -> anyhow::Result<()> {
         content: system_prompt,
     });
 
-    // Hidden capabilities stay dispatchable but off this brain's menu, so the
+    // Hidden capabilities stay dispatchable but off this program's menu, so the
     // model never sees them and never gets to request one.
     let mut allowed: HashSet<&str> = HashSet::with_capacity(inp.capabilities.len());
     for cap in inp.capabilities.iter().filter(|c| !c.hidden) {
@@ -290,9 +277,9 @@ fn run_camel() -> anyhow::Result<()> {
 
         let raw_obs = serde_json::to_string(&observations)
             .map_err(|e| anyhow::anyhow!("encode stub observations: {}", e))?;
-        // Feed the stubs back as a user message, matching the agent brain (the
+        // Feed the stubs back as a user message, matching the agent program (the
         // "tool" role is reserved by the OpenAI/DeepSeek API for native
-        // function-call results; this brain uses a text protocol). Only stubs
+        // function-call results; this program uses a text protocol). Only stubs
         // travel this way — never tool output.
         messages.push(Message {
             role: "user".into(),
@@ -377,8 +364,8 @@ fn substitute_compensate_args(content: &Value, store: &VarStore) -> anyhow::Resu
     Ok(out)
 }
 
-// -- Model reply decoding (mirrors brains/agent: same conversation/action
-// protocol; kept in-brain because it is cognition-level, not syscall
+// -- Model reply decoding (mirrors programs/agent: same conversation/action
+// protocol; kept in-program because it is cognition-level, not syscall
 // plumbing) --
 
 fn decode_model_envelopes(content: &str) -> anyhow::Result<Vec<ModelEnvelope>> {
@@ -588,7 +575,7 @@ mod tests {
         assert_eq!(got, content);
     }
 
-    // -- model reply decoding (smoke: shared shape with brains/agent) --
+    // -- model reply decoding (smoke: shared shape with programs/agent) --
 
     #[test]
     fn decode_accepts_an_actions_batch_with_hard_flag() {

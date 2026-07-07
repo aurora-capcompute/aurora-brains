@@ -1,0 +1,11 @@
+{
+  "description": "A general agent: plans with an LLM and drives its granted capabilities until the task is done, undoable effects registered along the way.",
+  "input": {
+    "type": "string",
+    "description": "The task, in natural language."
+  },
+  "output": {
+    "type": "string",
+    "description": "The final answer, in natural language."
+  }
+}
