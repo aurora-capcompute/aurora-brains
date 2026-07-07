@@ -48,7 +48,7 @@ manifest. A program crate contains only cognition; the boundary lives in the SDK
 ## A program ships with a manifest
 
 Every program declares its contract in an `interface.json` beside its source —
-a one-line `description` plus JSON Schemas for the process's input `message`
+a one-line `description` plus JSON Schemas for the process's `input`
 and its answer `output`:
 
 ```json

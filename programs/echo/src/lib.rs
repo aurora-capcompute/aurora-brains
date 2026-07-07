@@ -1,6 +1,6 @@
 //! echo — the smallest possible Aurora program. It reads its input through the
 //! SDK, needs no LLM and no capabilities, and returns a deterministic answer:
-//! the message it was given, or "pong" when none was. It exists to exercise the
+//! the input it was given, or "pong" when none was. It exists to exercise the
 //! multi-program path and to show how little a program is once the SDK owns the
 //! protocol — cognition here is a single `if`, and the plumbing is just
 //! [`sdk::input`] → [`sdk::output`].
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize)]
 struct Input {
     #[serde(default)]
-    message: String,
+    input: String,
 }
 
 /// The run's result payload, published via sys.output — the same `{"answer":
@@ -41,11 +41,11 @@ pub fn run(_: ()) -> FnResult<Json<Output>> {
 }
 
 fn echo() -> anyhow::Result<()> {
-    let input: Input = sdk::input()?;
-    let answer = if input.message.is_empty() {
+    let inp: Input = sdk::input()?;
+    let answer = if inp.input.is_empty() {
         "pong".to_string()
     } else {
-        input.message
+        inp.input
     };
     sdk::output(&Answer { answer })
 }

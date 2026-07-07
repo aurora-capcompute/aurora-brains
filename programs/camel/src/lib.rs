@@ -51,11 +51,9 @@ struct Output {
 
 #[derive(Deserialize)]
 struct Input {
-    message: String,
+    input: String,
     #[serde(default)]
     history: Vec<Message>,
-    #[serde(default)]
-    system_prompt: String,
     #[serde(default)]
     capabilities: Vec<Capability>,
     /// Which attempt this is (bumped by the host per retry) — lets the model
@@ -120,11 +118,11 @@ pub fn run(_: ()) -> FnResult<Json<Output>> {
 
 fn run_camel() -> anyhow::Result<()> {
     let inp: Input = sdk::input()?;
-    if inp.message.is_empty() {
-        anyhow::bail!("message is required");
+    if inp.input.is_empty() {
+        anyhow::bail!("input is required");
     }
 
-    let mut system_prompt = build_system_prompt(&inp.system_prompt, &inp.capabilities)?;
+    let mut system_prompt = build_system_prompt(&inp.capabilities)?;
     if inp.attempt > 1 {
         system_prompt.push_str(&format!(
             "\nThis is attempt {} of this task; earlier attempts were rolled back.",
@@ -157,7 +155,7 @@ fn run_camel() -> anyhow::Result<()> {
 
     messages.push(Message {
         role: "user".into(),
-        content: inp.message,
+        content: inp.input,
     });
 
     // The quarantine: raw tool results live here, keyed $1, $2, ... — never
@@ -289,13 +287,8 @@ fn run_camel() -> anyhow::Result<()> {
     }
 }
 
-fn build_system_prompt(user_prompt: &str, capabilities: &[Capability]) -> anyhow::Result<String> {
+fn build_system_prompt(capabilities: &[Capability]) -> anyhow::Result<String> {
     let mut prompt = String::new();
-    let trimmed = user_prompt.trim();
-    if !trimmed.is_empty() {
-        prompt.push_str(trimmed);
-        prompt.push_str("\n\n");
-    }
     prompt.push_str(PROTOCOL_PROMPT);
     prompt.push_str("\n\nAvailable tools for this run:");
     // Hidden capabilities are dispatchable but kept off the discoverable menu.
