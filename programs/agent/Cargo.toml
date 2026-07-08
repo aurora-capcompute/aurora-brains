@@ -13,3 +13,6 @@ anyhow.workspace = true
 extism-pdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Cloudflare's streaming HTML rewriter (pure Rust, wasm-proven) — used to strip
+# fetched pages down to text so one page can't flood the model's context.
+lol_html = "2"

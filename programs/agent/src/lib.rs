@@ -3,7 +3,9 @@ use aurora_program_sdk::{Call, Capability};
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm guest.\n\
 The host owns all side effects. Reply with exactly one compact JSON object containing an \"actions\" array.\n\
@@ -16,6 +18,22 @@ After receiving observations, either request more tools or return exactly one te
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish, or\n\
 {\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\",\"retry_seconds\":60}}]} to undo the registered effects and retry the task after the delay (omit retry_seconds to undo and stop).\n\
 Never combine a terminal action with tool calls in the same actions array.";
+
+// Context-management bounds. The transcript's serialized byte length is a cheap
+// proxy for tokens (~4 bytes/token); tune these to the model's real window.
+//   MAX_STEPS         — hard cap on agentic turns; the last turn is forced final.
+//   COMPACT_THRESHOLD — summarize the oldest messages once the transcript grows
+//                       past this (keeping the system prompt and newest turns).
+//   HARD_CEILING      — if it is still this large after compaction, force final.
+//   KEEP_RECENT       — messages at the tail kept verbatim, never summarized.
+const MAX_STEPS: u32 = 16;
+const COMPACT_THRESHOLD: usize = 512 * 1024;
+const HARD_CEILING: usize = 1024 * 1024;
+const KEEP_RECENT: usize = 6;
+
+const SUMMARY_PROMPT: &str = "You compress an AI agent's earlier working log. Preserve every fact, URL, identifier, number, finding, and decision needed to finish the task; drop repetition and chatter. Reply with prose only — no JSON, no tool calls.";
+
+const FINAL_DIRECTIVE: &str = "You have reached this run's step or size limit. Reply now with EXACTLY one final action and no tool calls: {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]}. Base the answer on what you already have.";
 
 // -- Data structures --
 
@@ -158,7 +176,9 @@ fn run_agent() -> anyhow::Result<()> {
         content: inp.input,
     });
 
+    let mut step: u32 = 0;
     loop {
+        step += 1;
         // Each agentic turn — one LLM call plus the tool calls it requests —
         // is a savepoint: sys.begin here, sys.commit at the turn's end. If the
         // turn breaks mid-way (a malformed model reply, an unavailable
@@ -167,6 +187,21 @@ fn run_agent() -> anyhow::Result<()> {
         // including the LLM call, giving the model a fresh chance — instead of
         // deterministically replaying the broken completion forever.
         let turn = sdk::savepoint()?;
+
+        // Keep the transcript within the model's window: once it crosses
+        // COMPACT_THRESHOLD, summarize the oldest messages (never the system
+        // prompt or the newest turns) into one message. The summary is itself a
+        // journaled LLM call, so a crash-resume rebuilds the same compacted
+        // history by replay.
+        maybe_compact(&mut messages)?;
+
+        // Bound the run. At the step budget — or if the transcript is still near
+        // the hard ceiling even after compaction — demand a final answer this
+        // turn instead of looping (or blowing the context) further.
+        if step >= MAX_STEPS || messages_bytes(&messages) >= HARD_CEILING {
+            return finalize(turn, &mut messages);
+        }
+
         let chat = llm_chat(&messages)?;
         let envelopes = decode_model_envelopes(&chat)
             .map_err(|e| anyhow::anyhow!("invalid model JSON: {}", e))?;
@@ -235,11 +270,18 @@ fn run_agent() -> anyhow::Result<()> {
                 },
                 args: Some(envelope.content.clone()),
             };
-            let response = if envelope.hard {
+            let mut response = if envelope.hard {
                 sdk::dispatch_hard(&tool_call)?
             } else {
                 sdk::dispatch(&tool_call)?
             };
+            // A fetched web page comes back as raw HTML; strip it to readable
+            // text so a single page can't flood the model's context. Guarded to
+            // GET responses whose content-type is text/html, so JSON API
+            // responses are left byte-for-byte intact.
+            if response.status == sdk::STATUS_RESULT {
+                strip_internet_html(&envelope.action, &envelope.content, &mut response.result);
+            }
             let obs = if response.status == sdk::STATUS_FAILED {
                 ToolObservation {
                     action: envelope.action.clone(),
@@ -273,6 +315,249 @@ fn run_agent() -> anyhow::Result<()> {
         });
         turn.commit()?;
     }
+}
+
+// messages_bytes is the serialized length of the transcript — the token proxy
+// the compaction and ceiling thresholds compare against.
+fn messages_bytes(messages: &[Message]) -> usize {
+    serde_json::to_string(messages)
+        .map(|s| s.len())
+        .unwrap_or(0)
+}
+
+// maybe_compact summarizes the oldest messages when the transcript grows past
+// COMPACT_THRESHOLD, keeping messages[0] (the system prompt: protocol + tool
+// menu) and the last KEEP_RECENT turns verbatim, and replacing the middle with a
+// single summary message. No-op below the threshold or when there is too little
+// middle to gain anything.
+fn maybe_compact(messages: &mut Vec<Message>) -> anyhow::Result<()> {
+    if messages_bytes(messages) < COMPACT_THRESHOLD || messages.len() <= KEEP_RECENT + 2 {
+        return Ok(());
+    }
+    let split = messages.len() - KEEP_RECENT;
+    let mut middle = String::new();
+    for m in &messages[1..split] {
+        middle.push_str(&m.role);
+        middle.push_str(": ");
+        middle.push_str(&m.content);
+        middle.push_str("\n\n");
+    }
+    let summary = summarize(&middle)?;
+    let mut rebuilt = Vec::with_capacity(2 + KEEP_RECENT);
+    rebuilt.push(messages[0].clone());
+    rebuilt.push(Message {
+        role: "user".into(),
+        content: format!("[Earlier steps, compacted to save context]\n{}", summary),
+    });
+    rebuilt.extend_from_slice(&messages[split..]);
+    *messages = rebuilt;
+    Ok(())
+}
+
+// summarize asks the LLM to compress an excerpt of the transcript. It is a
+// self-contained chat (its own system+user pair), not part of the agent's own
+// message list, and returns the summary text.
+fn summarize(excerpt: &str) -> anyhow::Result<String> {
+    let msgs = [
+        Message {
+            role: "system".into(),
+            content: SUMMARY_PROMPT.into(),
+        },
+        Message {
+            role: "user".into(),
+            content: format!("Compress these earlier steps:\n\n{}", excerpt),
+        },
+    ];
+    llm_chat(&msgs)
+}
+
+// finalize forces the run to a close: it commits the current turn after asking
+// the model for exactly one final action. If the model complies, that answer is
+// published; if it still refuses (returns tools, or unparseable), its best text
+// is salvaged so the run always terminates with an answer.
+fn finalize(turn: sdk::Savepoint, messages: &mut Vec<Message>) -> anyhow::Result<()> {
+    messages.push(Message {
+        role: "user".into(),
+        content: FINAL_DIRECTIVE.into(),
+    });
+    let chat = llm_chat(messages)?;
+    turn.commit()?;
+    if let Ok(envelopes) = decode_model_envelopes(&chat) {
+        if let Some(idx) = envelopes.iter().position(|e| e.action == "final") {
+            return output_final(&envelopes[idx]);
+        }
+        if let Some(idx) = envelopes.iter().position(|e| e.action == "abort") {
+            let (reason, retry) = abort_fields(&envelopes[idx]);
+            return sdk::abort(&reason, retry);
+        }
+    }
+    sdk::output(&FinishArgs {
+        answer: salvage_answer(&chat),
+    })
+}
+
+// abort_fields reads the reason and optional retry delay from an abort envelope.
+fn abort_fields(envelope: &ModelEnvelope) -> (String, Option<u64>) {
+    let reason = envelope
+        .content
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let retry = envelope
+        .content
+        .get("retry_seconds")
+        .and_then(|v| v.as_u64());
+    (reason, retry)
+}
+
+// salvage_answer extracts a usable answer from a reply that would not parse as a
+// final action — an "answer" field anywhere in its JSON, else the raw text.
+fn salvage_answer(chat: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(extract_json_region(chat)) {
+        if let Some(answer) = find_answer(&value) {
+            if !answer.is_empty() {
+                return answer;
+            }
+        }
+    }
+    let trimmed = chat.trim();
+    if trimmed.is_empty() {
+        "Reached the step or size limit before completing the task.".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+// find_answer walks a JSON value for the first non-empty "answer" string.
+fn find_answer(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(answer)) = map.get("answer") {
+                return Some(answer.clone());
+            }
+            map.values().find_map(find_answer)
+        }
+        Value::Array(items) => items.iter().find_map(find_answer),
+        _ => None,
+    }
+}
+
+// strip_internet_html rewrites a core.internet GET result's HTML body to plain
+// text in place. Non-internet calls, non-GET methods, and non-HTML responses are
+// left untouched, so JSON API payloads are never mangled.
+fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
+    if action != "core.internet" {
+        return;
+    }
+    let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if !method.eq_ignore_ascii_case("get") {
+        return;
+    }
+    let Some(Value::Object(obj)) = result.as_mut() else {
+        return;
+    };
+    let is_html = obj
+        .get("headers")
+        .and_then(|h| h.as_object())
+        .map(|headers| {
+            headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("content-type")
+                    && v.as_str()
+                        .map(|s| s.to_ascii_lowercase().contains("text/html"))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if !is_html {
+        return;
+    }
+    if let Some(Value::String(body)) = obj.get_mut("body") {
+        *body = html_to_text(body);
+    }
+}
+
+// html_to_text extracts readable text from HTML with lol_html (Cloudflare's
+// streaming rewriter): it keeps only ordinary `Data` text — so <script>/<style>/
+// <title> content, which the parser tags as ScriptData/RawText, is dropped — and
+// inserts a newline at block boundaries, then decodes common entities and
+// collapses whitespace. On a rewriter error the raw input is returned unchanged.
+fn html_to_text(html: &str) -> String {
+    use lol_html::html_content::TextType;
+    use lol_html::{element, rewrite_str, text, RewriteStrSettings};
+
+    let out = Rc::new(RefCell::new(String::new()));
+    let o_block = out.clone();
+    let o_text = out.clone();
+
+    let settings = RewriteStrSettings {
+        element_content_handlers: vec![
+            // Block-level elements: separate their text with a newline.
+            element!(
+                "p, div, br, li, tr, hr, section, article, header, footer, main, aside, nav, h1, h2, h3, h4, h5, h6, ul, ol, table, blockquote, pre, figure",
+                move |_el| {
+                    o_block.borrow_mut().push('\n');
+                    Ok(())
+                }
+            ),
+            // Keep only ordinary text; script/style/raw-text chunks are dropped.
+            text!("*", move |t| {
+                if t.text_type() == TextType::Data {
+                    o_text.borrow_mut().push_str(t.as_str());
+                }
+                Ok(())
+            }),
+        ],
+        ..RewriteStrSettings::default()
+    };
+
+    if rewrite_str(html, settings).is_err() {
+        return html.to_string();
+    }
+    let raw = out.borrow().clone();
+    collapse_ws(&decode_entities(&raw))
+}
+
+// decode_entities expands the handful of HTML entities lol_html leaves in text.
+// "&amp;" is expanded last so an already-decoded "&lt;" is not re-decoded.
+fn decode_entities(s: &str) -> String {
+    s.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+// collapse_ws squeezes runs of spaces/tabs to one space and runs of newlines to
+// at most a blank line, so extracted text reads as paragraphs without the
+// original markup's whitespace.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    let mut pending_newlines = 0u32;
+    for ch in s.chars() {
+        if ch == '\n' || ch == '\r' {
+            pending_newlines += 1;
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_newlines > 0 {
+            if !out.is_empty() {
+                out.push_str(if pending_newlines >= 2 { "\n\n" } else { "\n" });
+            }
+        } else if pending_space && !out.is_empty() {
+            out.push(' ');
+        }
+        pending_space = false;
+        pending_newlines = 0;
+        out.push(ch);
+    }
+    out.trim().to_string()
 }
 
 fn build_system_prompt(capabilities: &[Capability]) -> anyhow::Result<String> {
