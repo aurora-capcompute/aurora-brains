@@ -26,9 +26,15 @@ Never combine a terminal action with tool calls in the same actions array.";
 //                       past this (keeping the system prompt and newest turns).
 //   HARD_CEILING      — if it is still this large after compaction, force final.
 //   KEEP_RECENT       — messages at the tail kept verbatim, never summarized.
+//
+// Both size bounds MUST stay below the core.openaiApi driver's max_request_bytes
+// (default 1 MiB): the chat request it caps is essentially the transcript, so a
+// summary or forced-final call at these sizes still has to fit under that cap.
+// The margin (here ~256 KiB below 1 MiB) absorbs the request wrapper plus one
+// turn's added observations before the next compaction runs.
 const MAX_STEPS: u32 = 16;
 const COMPACT_THRESHOLD: usize = 512 * 1024;
-const HARD_CEILING: usize = 1024 * 1024;
+const HARD_CEILING: usize = 768 * 1024;
 const KEEP_RECENT: usize = 6;
 
 const SUMMARY_PROMPT: &str = "You compress an AI agent's earlier working log. Preserve every fact, URL, identifier, number, finding, and decision needed to finish the task; drop repetition and chatter. Reply with prose only — no JSON, no tool calls.";
