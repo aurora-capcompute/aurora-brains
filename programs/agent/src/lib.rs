@@ -208,7 +208,7 @@ fn run_agent() -> anyhow::Result<()> {
             return finalize(turn, &mut messages);
         }
 
-        let chat = llm_chat(&messages)?;
+        let chat = chat_within_budget(&mut messages)?;
         let envelopes = decode_model_envelopes(&chat)
             .map_err(|e| anyhow::anyhow!("invalid model JSON: {}", e))?;
 
@@ -323,6 +323,59 @@ fn run_agent() -> anyhow::Result<()> {
     }
 }
 
+// chat_within_budget calls the LLM and, if the request is rejected for size
+// (the core.openaiApi max_request_bytes cap, or a provider context-length
+// error), sheds transcript bytes and retries until it fits or nothing more can
+// be shed. It adapts to whatever request cap the host is configured with, below
+// the proactive COMPACT_THRESHOLD/HARD_CEILING bounds. Each failed-then-retried
+// call is journaled, so a crash-resume replays the same sequence. A host yield
+// (e.g. an approval) is not a size error and propagates unchanged.
+fn chat_within_budget(messages: &mut [Message]) -> anyhow::Result<String> {
+    loop {
+        match llm_chat(messages) {
+            Ok(chat) => return Ok(chat),
+            Err(e) => {
+                if !is_size_error(&e.to_string()) || !shrink_messages(messages) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+// is_size_error recognizes a request-too-large failure — the driver's byte cap
+// or a provider's context-length rejection — versus a genuine host error.
+fn is_size_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("exceed")
+        || m.contains("too large")
+        || m.contains("too long")
+        || m.contains("too many tokens")
+        || m.contains("context length")
+        || m.contains("context_length")
+        || m.contains("maximum context")
+}
+
+// shrink_messages halves the largest non-system message in place (head+tail
+// around an elision marker) — the fastest way to bring an oversized request
+// under the cap regardless of which observation blew it up. Returns false once
+// every message is already small, so the retry loop terminates.
+fn shrink_messages(messages: &mut [Message]) -> bool {
+    let Some(i) = (1..messages.len()).max_by_key(|&i| messages[i].content.len()) else {
+        return false;
+    };
+    let count = messages[i].content.chars().count();
+    if count <= 2048 {
+        return false;
+    }
+    let chars: Vec<char> = messages[i].content.chars().collect();
+    let keep = count / 2;
+    let head: String = chars[..keep / 2].iter().collect();
+    let tail: String = chars[count - (keep - keep / 2)..].iter().collect();
+    messages[i].content = format!("{head}\n…[truncated to fit the request limit]…\n{tail}");
+    true
+}
+
 // messages_bytes is the serialized length of the transcript — the token proxy
 // the compaction and ceiling thresholds compare against.
 fn messages_bytes(messages: &[Message]) -> usize {
@@ -386,7 +439,7 @@ fn finalize(turn: sdk::Savepoint, messages: &mut Vec<Message>) -> anyhow::Result
         role: "user".into(),
         content: FINAL_DIRECTIVE.into(),
     });
-    let chat = llm_chat(messages)?;
+    let chat = chat_within_budget(messages)?;
     turn.commit()?;
     if let Ok(envelopes) = decode_model_envelopes(&chat) {
         if let Some(idx) = envelopes.iter().position(|e| e.action == "final") {
