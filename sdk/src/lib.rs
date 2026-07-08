@@ -357,10 +357,13 @@ pub fn log(message: &str) {
 /// Capability is one tool the host has granted this run — the guest's decoded
 /// view of capcompute's `sys.Capability`. A program reads `name`/`description`/
 /// `input_schema` to build its tool menu, and may consult `hidden` (keep a
-/// dispatchable tool off that menu) and `labels`/`forbid` (the provenance a
-/// result carries and the labels barred from its args). Decode-only: the host
-/// owns the record. How an effect is undone is not capability metadata — the
-/// guest registers concrete undos with [`compensate`].
+/// dispatchable tool off that menu). A capability names an ADT family whose
+/// operations are cases of `input_schema` (a `oneOf` discriminated by an
+/// `operation`/`method` field), so a leaf grant is one tool, not several.
+/// Data-flow provenance is per call, not per capability: read [`HostResponse`]'s
+/// `labels` on each result. Decode-only: the host owns the record. How an effect
+/// is undone is not capability metadata — the guest registers concrete undos
+/// with [`compensate`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Capability {
     pub name: String,
@@ -371,10 +374,4 @@ pub struct Capability {
     /// Dispatchable, but excluded from the program's discoverable tool menu.
     #[serde(default)]
     pub hidden: bool,
-    /// Source classes this capability's results carry (taint labels).
-    #[serde(default)]
-    pub labels: Vec<String>,
-    /// Labels that may not flow into this capability's args.
-    #[serde(default)]
-    pub forbid: Vec<String>,
 }

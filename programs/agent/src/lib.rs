@@ -46,6 +46,9 @@ struct Message {
 
 #[derive(Serialize)]
 struct LlmRequest<'a> {
+    // The ADT discriminator selecting the chat operation of the core.openaiApi
+    // family; the host routes on it and strips it from the provider request.
+    operation: &'static str,
     messages: &'a [Message],
 }
 
@@ -443,10 +446,13 @@ fn output_final(envelope: &ModelEnvelope) -> anyhow::Result<()> {
 }
 
 fn llm_chat(messages: &[Message]) -> anyhow::Result<String> {
-    let req = LlmRequest { messages };
+    let req = LlmRequest {
+        operation: "chat",
+        messages,
+    };
     let args = serde_json::to_value(&req)?;
     let response = sdk::dispatch(&Call {
-        name: "openai.chat".into(),
+        name: "core.openaiApi".into(),
         args: Some(args),
     })?;
     if response.status != sdk::STATUS_RESULT {
