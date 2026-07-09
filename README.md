@@ -35,12 +35,13 @@ do anything the host didn't grant.
               │  HTTP /v1
          aurora-dist                         ← the server (one binary you run)
               │  assembled from…
-   ┌──────────┼─────────────────────┐
- aurora-       aurora-dispatchers     capcompute
- capcompute    (capability drivers)   (the kernel)
-              │
-        aurora-brains                        ◀── YOU ARE HERE
-        (the Wasm agent "programs" that run inside)
+   ┌──────────┴──────────┐
+ aurora-capcompute    aurora-dispatchers     ← orchestration runtime + capability drivers
+   └──────────┬──────────┘
+              │  both built on
+         capcompute                          ← the kernel (the foundation)
+
+   aurora-brains  ◀── YOU ARE HERE (the Wasm agent "programs" that run inside)
 ```
 
 You build a program here into a `<name>.wasm` + `<name>.json` pair, drop it into
