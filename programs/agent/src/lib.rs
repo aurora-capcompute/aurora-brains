@@ -181,10 +181,12 @@ fn run_agent() -> anyhow::Result<()> {
     for cap in inp.capabilities.iter().filter(|c| !c.hidden) {
         allowed.insert(cap.name.as_str());
     }
-    // Whether a large read can be offloaded to the store: core.memory must be
+    // Whether a large read can be offloaded to scratch: core.scratch must be
     // granted and visible — a hidden grant the model can't search is no use for
-    // this, so it falls back to an inline summary instead.
-    let has_memory = allowed.contains("core.memory");
+    // this, so it falls back to an inline summary instead. Scratch is
+    // process-local and ephemeral, so an offloaded page never touches durable or
+    // shared storage.
+    let has_scratch = allowed.contains("core.scratch");
 
     for (i, msg) in inp.history.iter().enumerate() {
         if msg.role != "user" && msg.role != "assistant" {
@@ -326,7 +328,7 @@ fn run_agent() -> anyhow::Result<()> {
                     &envelope.content,
                     &mut response.result,
                     &task,
-                    has_memory,
+                    has_scratch,
                 )?;
             }
             let obs = if response.status == sdk::STATUS_FAILED {
@@ -589,18 +591,19 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
 
 // maybe_offload_internet keeps one large read from flooding the window: when a
 // successful core.internet GET body (after HTML stripping) exceeds
-// OFFLOAD_THRESHOLD, the full body is stored under a content-addressed key and
-// the observation's `body` is replaced with a task-conditioned summary, a short
-// verbatim excerpt, and that key — framed so the model treats it as a pointer,
-// not the content, and reaches for core.memory search (never get) to read on.
-// Without a usable memory grant, or if the store write fails, it still shrinks
-// the body to the summary + excerpt inline rather than passing the whole page on.
+// OFFLOAD_THRESHOLD, the full body is stored in process-local scratch under a
+// content-addressed key and the observation's `body` is replaced with a
+// task-conditioned summary, a short verbatim excerpt, and that key — framed so
+// the model treats it as a pointer, not the content, and reaches for
+// core.scratch search (never get) to read on. Without a usable scratch grant,
+// or if the store write fails, it still shrinks the body to the summary +
+// excerpt inline rather than passing the whole page on.
 fn maybe_offload_internet(
     action: &str,
     args: &Value,
     result: &mut Option<Value>,
     task: &str,
-    has_memory: bool,
+    has_scratch: bool,
 ) -> anyhow::Result<()> {
     if action != "core.internet" {
         return Ok(());
@@ -620,7 +623,7 @@ fn maybe_offload_internet(
     let key = format!("fetch/{}", content_hash(&body));
 
     // Store the full body first (best-effort), then summarize a bounded prefix.
-    let stored = has_memory && store_blob(&key, &body).is_ok();
+    let stored = has_scratch && store_blob(&key, &body).is_ok();
     let excerpt = head_excerpt(&body, FETCH_EXCERPT_BYTES);
     let summary = summarize_fetch(task, url, truncate_bytes(&body, HARD_CEILING))?;
 
@@ -656,7 +659,7 @@ fn maybe_offload_internet(
 fn offload_note(bytes: usize, stored_key: Option<&str>) -> String {
     match stored_key {
         Some(key) => format!(
-            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response — the full text is NOT in this conversation. It is stored in tenant memory under the key \"{key}\". To read specific details, call core.memory search on that key (a bounded regex grep over the stored value). Do NOT call get on it — get returns the whole large value and would re-flood this context."
+            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response — the full text is NOT in this conversation. It is stored in this process's scratch memory under the key \"{key}\". To read specific details, call core.scratch search on that key (a bounded regex grep over the stored value). Do NOT call get on it — get returns the whole large value and would re-flood this context."
         ),
         None => format!(
             "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response; the full text could not be stored and is NOT available. Work from this, or re-fetch a narrower page."
@@ -664,17 +667,18 @@ fn offload_note(bytes: usize, stored_key: Option<&str>) -> String {
     }
 }
 
-// store_blob writes a value into tenant memory under key (best-effort). A denied
-// grant or an over-cap value comes back as an error or a failed status; either
-// way the caller falls back to an inline summary, so this never aborts the run.
+// store_blob writes a value into process-local scratch under key (best-effort).
+// A denied grant or an over-cap value comes back as an error or a failed status;
+// either way the caller falls back to an inline summary, so this never aborts
+// the run.
 fn store_blob(key: &str, value: &str) -> anyhow::Result<()> {
     let args = serde_json::json!({ "operation": "put", "key": key, "value": value });
     let response = sdk::dispatch(&Call {
-        name: "core.memory".into(),
+        name: "core.scratch".into(),
         args: Some(args),
     })?;
     if response.status != sdk::STATUS_RESULT {
-        anyhow::bail!("memory put failed: {}", response.message);
+        anyhow::bail!("scratch put failed: {}", response.message);
     }
     Ok(())
 }
