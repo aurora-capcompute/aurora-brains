@@ -175,8 +175,20 @@ fn run_camel() -> anyhow::Result<()> {
         // instead of deterministically replaying the broken completion forever.
         let turn = sdk::savepoint()?;
         let chat = llm_chat(&messages)?;
-        let envelopes = decode_model_envelopes(&chat)
-            .map_err(|e| anyhow::anyhow!("invalid model JSON: {}", e))?;
+        let envelopes = match decode_model_envelopes(&chat) {
+            Ok(envelopes) => envelopes,
+            // The reply didn't parse as an action envelope — usually the model
+            // answered directly in prose instead of the required JSON. Take
+            // that reply as the answer rather than failing the process, routing
+            // it through the same $N substitution a proper final gets so the
+            // quarantine still holds. The turn's LLM call is journaled, so a
+            // resume replays this salvage.
+            Err(_) => {
+                let answer = salvage(&chat, &store)?;
+                turn.commit()?;
+                return sdk::output(&FinishArgs { answer });
+            }
+        };
 
         let has_tool = envelopes
             .iter()
@@ -346,6 +358,23 @@ fn final_answer(content: &Value, store: &VarStore) -> anyhow::Result<String> {
         Value::String(s) => s,
         other => other.to_string(),
     })
+}
+
+/// salvage turns a reply that didn't parse as an action envelope into an answer
+/// — the model answered in prose instead of the JSON protocol. Its $N
+/// references are substituted just like a proper final's, so the quarantine
+/// still holds; an out-of-range reference (or empty reply) falls back to the raw
+/// trimmed text rather than failing the run.
+fn salvage(chat: &str, store: &VarStore) -> anyhow::Result<String> {
+    let trimmed = chat.trim();
+    if trimmed.is_empty() {
+        return Ok("The model returned an empty reply.".into());
+    }
+    match substitute(&Value::String(trimmed.to_string()), store) {
+        Ok(Value::String(s)) => Ok(s),
+        Ok(other) => Ok(other.to_string()),
+        Err(_) => Ok(trimmed.to_string()),
+    }
 }
 
 /// substitute_compensate_args resolves $N references in a compensate
@@ -554,6 +583,32 @@ mod tests {
     fn final_answer_fails_on_unknown_variable() {
         let store = VarStore::default();
         assert!(final_answer(&json!({"answer": "$1"}), &store).is_err());
+    }
+
+    // -- salvage (a prose reply that isn't the action envelope) --
+
+    #[test]
+    fn salvage_returns_prose_verbatim() {
+        let store = VarStore::default();
+        assert_eq!(salvage("\n\nHere is the answer.\n", &store).unwrap(), "Here is the answer.");
+    }
+
+    #[test]
+    fn salvage_substitutes_quarantine_refs() {
+        let store = store_with(&[json!("42 items")]);
+        assert_eq!(salvage("Found: $1.", &store).unwrap(), "Found: 42 items.");
+    }
+
+    #[test]
+    fn salvage_of_a_bad_ref_falls_back_to_raw_text() {
+        let store = VarStore::default();
+        assert_eq!(salvage("see $9 for details", &store).unwrap(), "see $9 for details");
+    }
+
+    #[test]
+    fn salvage_of_empty_reply_is_nonempty() {
+        let store = VarStore::default();
+        assert!(!salvage("   ", &store).unwrap().is_empty());
     }
 
     // -- substitute_compensate_args --

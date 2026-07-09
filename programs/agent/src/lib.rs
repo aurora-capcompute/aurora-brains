@@ -209,8 +209,18 @@ fn run_agent() -> anyhow::Result<()> {
         }
 
         let chat = chat_within_budget(&mut messages)?;
-        let envelopes = decode_model_envelopes(&chat)
-            .map_err(|e| anyhow::anyhow!("invalid model JSON: {}", e))?;
+        let envelopes = match decode_model_envelopes(&chat) {
+            Ok(envelopes) => envelopes,
+            // The reply didn't parse as an action envelope — most often the
+            // model answered directly in prose, judging no tool was needed
+            // (occasionally a truncated batch). That reply is still the answer:
+            // end the run with it rather than failing the process. This turn's
+            // LLM call is already journaled, so a resume replays this salvage.
+            Err(_) => {
+                turn.commit()?;
+                return wrap_up(&chat);
+            }
+        };
 
         let has_tool = envelopes
             .iter()
@@ -441,7 +451,17 @@ fn finalize(turn: sdk::Savepoint, messages: &mut Vec<Message>) -> anyhow::Result
     });
     let chat = chat_within_budget(messages)?;
     turn.commit()?;
-    if let Ok(envelopes) = decode_model_envelopes(&chat) {
+    wrap_up(&chat)
+}
+
+// wrap_up ends the run from a model reply that ought to carry a terminal
+// action: use its final (or abort) when the reply parses, otherwise salvage a
+// usable answer from it. Shared by the step/size-limit path (finalize) and the
+// recovery when a mid-loop reply doesn't parse as the action envelope at all —
+// so a model that simply answered in prose finishes the process instead of
+// failing it.
+fn wrap_up(chat: &str) -> anyhow::Result<()> {
+    if let Ok(envelopes) = decode_model_envelopes(chat) {
         if let Some(idx) = envelopes.iter().position(|e| e.action == "final") {
             return output_final(&envelopes[idx]);
         }
@@ -451,7 +471,7 @@ fn finalize(turn: sdk::Savepoint, messages: &mut Vec<Message>) -> anyhow::Result
         }
     }
     sdk::output(&FinishArgs {
-        answer: salvage_answer(&chat),
+        answer: salvage_answer(chat),
     })
 }
 
@@ -856,4 +876,53 @@ fn progress_summary(action: &str, content: &Value) -> String {
         }
     }
     format!("⚙ {}", action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A model that answers directly in prose — no action envelope — must not
+    // parse as an envelope; wrap_up then salvages it (see below) rather than
+    // failing the run, which is the bug this guards against.
+    #[test]
+    fn prose_reply_is_not_a_valid_envelope() {
+        let prose = "\n\nWarp has real trade-offs. **Strengths:** fast, modern. \
+                     **Weaknesses:** closed-source. Verdict: worth trying.";
+        assert!(decode_model_envelopes(prose).is_err());
+    }
+
+    // Salvage returns the model's prose verbatim (trimmed) as the answer.
+    #[test]
+    fn salvage_returns_prose_verbatim() {
+        let prose = "\n\nWarp is a modern terminal with AI features.\n";
+        assert_eq!(
+            salvage_answer(prose),
+            "Warp is a modern terminal with AI features."
+        );
+    }
+
+    // When the reply is JSON carrying an "answer" somewhere, salvage prefers it
+    // over the raw text (a near-miss final that didn't decode as an envelope).
+    #[test]
+    fn salvage_prefers_an_embedded_answer_field() {
+        let reply = r#"{"content":{"answer":"the moon is 384400 km away"}}"#;
+        assert_eq!(salvage_answer(reply), "the moon is 384400 km away");
+    }
+
+    // An empty reply salvages to a stable placeholder, never an empty answer.
+    #[test]
+    fn salvage_of_empty_reply_is_nonempty() {
+        assert!(!salvage_answer("   ").is_empty());
+    }
+
+    // A proper final envelope still decodes normally — salvage is a fallback,
+    // not the primary path.
+    #[test]
+    fn well_formed_final_still_decodes() {
+        let reply = r#"{"actions":[{"action":"final","content":{"answer":"hi"}}]}"#;
+        let envelopes = decode_model_envelopes(reply).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].action, "final");
+    }
 }
