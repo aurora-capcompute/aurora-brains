@@ -39,6 +39,12 @@ const COMPACT_THRESHOLD: usize = 512 * 1024;
 const HARD_CEILING: usize = 768 * 1024;
 const KEEP_RECENT: usize = 6;
 
+// MAX_COMPLETION_TOKENS caps each model reply so a long final answer is not
+// truncated by a smaller provider default (a truncated reply loses its closing
+// JSON and only salvages as partial text). Tool-call turns are short JSON and
+// stop well under it; only a verbose final answer approaches it.
+const MAX_COMPLETION_TOKENS: u32 = 4096;
+
 // A large tool read (a fetched page bigger than this, after HTML stripping) is
 // offloaded to memory instead of inlined: the full body is stored under a
 // content-addressed key and the model is handed a summary + a short verbatim
@@ -89,6 +95,9 @@ struct LlmRequest<'a> {
     // family; the host routes on it and strips it from the provider request.
     operation: &'static str,
     messages: &'a [Message],
+    // Cap the reply so a long final answer is not truncated by the provider's
+    // default; forwarded verbatim to the provider by the driver.
+    max_completion_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -1047,6 +1056,7 @@ fn llm_chat(messages: &[Message]) -> anyhow::Result<String> {
     let req = LlmRequest {
         operation: "chat",
         messages,
+        max_completion_tokens: MAX_COMPLETION_TOKENS,
     };
     let args = serde_json::to_value(&req)?;
     let response = sdk::dispatch(&Call {
@@ -1169,6 +1179,27 @@ mod tests {
         let truncated =
             r#"{"actions":[{"action":"final","content":{"answer":"line1\nline2 \"q\" tail"#;
         assert_eq!(salvage_answer(truncated), "line1\nline2 \"q\" tail");
+    }
+
+    // The chat request carries a completion-token cap so a long final answer is
+    // not truncated by the provider default.
+    #[test]
+    fn llm_request_caps_completion_tokens() {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let value = serde_json::to_value(LlmRequest {
+            operation: "chat",
+            messages: &messages,
+            max_completion_tokens: MAX_COMPLETION_TOKENS,
+        })
+        .unwrap();
+        assert_eq!(value["operation"], "chat");
+        assert_eq!(
+            value["max_completion_tokens"].as_u64(),
+            Some(MAX_COMPLETION_TOKENS as u64)
+        );
     }
 
     // A proper final envelope still decodes normally — salvage is a fallback,
