@@ -4,7 +4,9 @@ use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm guest.\n\
@@ -37,7 +39,20 @@ const COMPACT_THRESHOLD: usize = 512 * 1024;
 const HARD_CEILING: usize = 768 * 1024;
 const KEEP_RECENT: usize = 6;
 
+// A large tool read (a fetched page bigger than this, after HTML stripping) is
+// offloaded to memory instead of inlined: the full body is stored under a
+// content-addressed key and the model is handed a summary + a short verbatim
+// excerpt + that key, so one big page can't flood — or, via get, repeatedly
+// re-flood — the window. The summary's input is capped at HARD_CEILING (the
+// model's per-turn budget); the full body still lives in the store, searchable
+// whole. Below the threshold a read inlines as before — a round-trip to the
+// store would be pure overhead.
+const OFFLOAD_THRESHOLD: usize = 48 * 1024;
+const FETCH_EXCERPT_BYTES: usize = 2 * 1024;
+
 const SUMMARY_PROMPT: &str = "You compress an AI agent's earlier working log. Preserve every fact, URL, identifier, number, finding, and decision needed to finish the task; drop repetition and chatter. Reply with prose only — no JSON, no tool calls.";
+
+const FETCH_SUMMARY_PROMPT: &str = "You compress a web page an AI agent just fetched, toward a specific task. Preserve every fact, URL, identifier, number, quote, name, and finding relevant to that task; drop navigation, ads, and boilerplate. Reply with prose only — no JSON, no tool calls.";
 
 const FINAL_DIRECTIVE: &str = "You have reached this run's step or size limit. Reply now with EXACTLY one final action and no tool calls: {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]}. Base the answer on what you already have.";
 
@@ -166,6 +181,10 @@ fn run_agent() -> anyhow::Result<()> {
     for cap in inp.capabilities.iter().filter(|c| !c.hidden) {
         allowed.insert(cap.name.as_str());
     }
+    // Whether a large read can be offloaded to the store: core.memory must be
+    // granted and visible — a hidden grant the model can't search is no use for
+    // this, so it falls back to an inline summary instead.
+    let has_memory = allowed.contains("core.memory");
 
     for (i, msg) in inp.history.iter().enumerate() {
         if msg.role != "user" && msg.role != "assistant" {
@@ -177,6 +196,9 @@ fn run_agent() -> anyhow::Result<()> {
         messages.push(msg.clone());
     }
 
+    // Capture the task before the move — it conditions the summary of any large
+    // read offloaded to the store, so the summary keeps what this run needs.
+    let task = inp.input.clone();
     messages.push(Message {
         role: "user".into(),
         content: inp.input,
@@ -294,9 +316,18 @@ fn run_agent() -> anyhow::Result<()> {
             // A fetched web page comes back as raw HTML; strip it to readable
             // text so a single page can't flood the model's context. Guarded to
             // GET responses whose content-type is text/html, so JSON API
-            // responses are left byte-for-byte intact.
+            // responses are left byte-for-byte intact. Then, if the (stripped)
+            // body is still large, offload it to the store and replace it with a
+            // summary + excerpt + key the model can search on demand.
             if response.status == sdk::STATUS_RESULT {
                 strip_internet_html(&envelope.action, &envelope.content, &mut response.result);
+                maybe_offload_internet(
+                    &envelope.action,
+                    &envelope.content,
+                    &mut response.result,
+                    &task,
+                    has_memory,
+                )?;
             }
             let obs = if response.status == sdk::STATUS_FAILED {
                 ToolObservation {
@@ -554,6 +585,158 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
     if let Some(Value::String(body)) = obj.get_mut("body") {
         *body = html_to_text(body);
     }
+}
+
+// maybe_offload_internet keeps one large read from flooding the window: when a
+// successful core.internet GET body (after HTML stripping) exceeds
+// OFFLOAD_THRESHOLD, the full body is stored under a content-addressed key and
+// the observation's `body` is replaced with a task-conditioned summary, a short
+// verbatim excerpt, and that key — framed so the model treats it as a pointer,
+// not the content, and reaches for core.memory search (never get) to read on.
+// Without a usable memory grant, or if the store write fails, it still shrinks
+// the body to the summary + excerpt inline rather than passing the whole page on.
+fn maybe_offload_internet(
+    action: &str,
+    args: &Value,
+    result: &mut Option<Value>,
+    task: &str,
+    has_memory: bool,
+) -> anyhow::Result<()> {
+    if action != "core.internet" {
+        return Ok(());
+    }
+    let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if !method.eq_ignore_ascii_case("get") {
+        return Ok(());
+    }
+    let body = match result.as_ref() {
+        Some(Value::Object(obj)) => match obj.get("body") {
+            Some(Value::String(body)) if body.len() > OFFLOAD_THRESHOLD => body.clone(),
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let key = format!("fetch/{}", content_hash(&body));
+
+    // Store the full body first (best-effort), then summarize a bounded prefix.
+    let stored = has_memory && store_blob(&key, &body).is_ok();
+    let excerpt = head_excerpt(&body, FETCH_EXCERPT_BYTES);
+    let summary = summarize_fetch(task, url, truncate_bytes(&body, HARD_CEILING))?;
+
+    // Rebuild the observation: keep the response's other fields (url, status,
+    // headers), drop the raw body, and add the offload fields + guidance.
+    let mut offloaded = serde_json::Map::new();
+    if let Some(Value::Object(orig)) = result.as_ref() {
+        for (k, v) in orig {
+            if k != "body" {
+                offloaded.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let stored_key = stored.then_some(key.as_str());
+    offloaded.insert("bytes".into(), Value::Number((body.len() as u64).into()));
+    offloaded.insert("excerpt".into(), Value::String(excerpt));
+    offloaded.insert("summary".into(), Value::String(summary));
+    if let Some(k) = stored_key {
+        offloaded.insert("stored_key".into(), Value::String(k.to_string()));
+    }
+    offloaded.insert(
+        "note".into(),
+        Value::String(offload_note(body.len(), stored_key)),
+    );
+    *result = Some(Value::Object(offloaded));
+    Ok(())
+}
+
+// offload_note frames the offloaded observation for the model: it is a pointer,
+// not the content, and the way to read on is core.memory search — never get,
+// which returns the whole large value and re-floods context. When the body
+// couldn't be stored, it says only this summary + excerpt remains.
+fn offload_note(bytes: usize, stored_key: Option<&str>) -> String {
+    match stored_key {
+        Some(key) => format!(
+            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response — the full text is NOT in this conversation. It is stored in tenant memory under the key \"{key}\". To read specific details, call core.memory search on that key (a bounded regex grep over the stored value). Do NOT call get on it — get returns the whole large value and would re-flood this context."
+        ),
+        None => format!(
+            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response; the full text could not be stored and is NOT available. Work from this, or re-fetch a narrower page."
+        ),
+    }
+}
+
+// store_blob writes a value into tenant memory under key (best-effort). A denied
+// grant or an over-cap value comes back as an error or a failed status; either
+// way the caller falls back to an inline summary, so this never aborts the run.
+fn store_blob(key: &str, value: &str) -> anyhow::Result<()> {
+    let args = serde_json::json!({ "operation": "put", "key": key, "value": value });
+    let response = sdk::dispatch(&Call {
+        name: "core.memory".into(),
+        args: Some(args),
+    })?;
+    if response.status != sdk::STATUS_RESULT {
+        anyhow::bail!("memory put failed: {}", response.message);
+    }
+    Ok(())
+}
+
+// summarize_fetch compresses one fetched page toward the run's task, so the
+// summary keeps the details this run needs and drops the rest. A self-contained
+// chat, like summarize().
+fn summarize_fetch(task: &str, url: &str, body: &str) -> anyhow::Result<String> {
+    // chat_within_budget (not a bare llm_chat) so a body at HARD_CEILING still
+    // fits when the host's max_request_bytes is set below the 1 MiB default: it
+    // sheds the body and retries rather than failing the summary.
+    let mut msgs = [
+        Message {
+            role: "system".into(),
+            content: FETCH_SUMMARY_PROMPT.into(),
+        },
+        Message {
+            role: "user".into(),
+            content: format!(
+                "The agent is working on this task:\n{}\n\nSummarize the page below (fetched from {}) toward that task:\n\n{}",
+                truncate_bytes(task, 512),
+                url,
+                body
+            ),
+        },
+    ];
+    chat_within_budget(&mut msgs)
+}
+
+// content_hash is a short, replay-stable hex digest of a value — the fetch key,
+// so the same page fetched twice addresses one stored blob. DefaultHasher's keys
+// are fixed (not randomized), so the digest is identical across a resume's
+// replay; it is a cache key, not a security digest.
+fn content_hash(s: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+// head_excerpt returns the first max bytes of s (on a char boundary) with a
+// marker when it was cut, so the model keeps verbatim anchor text (exact URLs,
+// names, numbers) the lossy summary might drop.
+fn head_excerpt(s: &str, max: usize) -> String {
+    let head = truncate_bytes(s, max);
+    if head.len() < s.len() {
+        format!("{head}\n…[excerpt only — full text stored, not shown]")
+    } else {
+        head.to_string()
+    }
+}
+
+// truncate_bytes clamps s to at most max bytes, backing up to the nearest char
+// boundary so the result stays valid UTF-8.
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // html_to_text extracts readable text from HTML with lol_html (Cloudflare's
@@ -924,5 +1107,50 @@ mod tests {
         let envelopes = decode_model_envelopes(reply).unwrap();
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].action, "final");
+    }
+
+    // -- large-read offload helpers --
+
+    // The content hash is stable for a given input (so a resume's replay
+    // addresses the same stored blob) and separates distinct inputs.
+    #[test]
+    fn content_hash_is_stable_and_distinct() {
+        assert_eq!(content_hash("the same page"), content_hash("the same page"));
+        assert_ne!(content_hash("page a"), content_hash("page b"));
+        assert_eq!(content_hash("x").len(), 16);
+    }
+
+    // truncate_bytes clamps to a byte budget without splitting a multi-byte char.
+    #[test]
+    fn truncate_bytes_respects_char_boundaries() {
+        assert_eq!(truncate_bytes("hello", 100), "hello");
+        assert_eq!(truncate_bytes("hello", 3), "hel");
+        // "é" is two bytes; a 3-byte clamp of "aé" must drop it, not split it.
+        assert_eq!(truncate_bytes("aé", 2), "a");
+    }
+
+    // The excerpt is verbatim when it fits and carries a cut marker when it
+    // doesn't, so the model can tell a partial excerpt from a whole small body.
+    #[test]
+    fn head_excerpt_marks_truncation() {
+        assert_eq!(head_excerpt("short", 100), "short");
+        let cut = head_excerpt("abcdefghij", 4);
+        assert!(cut.starts_with("abcd"));
+        assert!(cut.contains("excerpt only"));
+    }
+
+    // The stored-key note steers to search and warns off get; the no-store note
+    // says only the summary+excerpt remains. Both must read as "not the content".
+    #[test]
+    fn offload_note_directs_to_search_when_stored() {
+        let stored = offload_note(900_000, Some("fetch/abc"));
+        assert!(stored.contains("fetch/abc"));
+        assert!(stored.contains("search"));
+        assert!(stored.contains("NOT"));
+        assert!(stored.to_lowercase().contains("do not call get"));
+
+        let missing = offload_note(900_000, None);
+        assert!(missing.contains("could not be stored"));
+        assert!(!missing.contains("fetch/"));
     }
 }
