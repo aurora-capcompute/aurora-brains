@@ -533,12 +533,59 @@ fn salvage_answer(chat: &str) -> String {
             }
         }
     }
+    // The JSON did not parse as a whole — most often a long final answer
+    // truncated by the model's token limit, leaving an unbalanced envelope.
+    // Recover the answer field's text directly so the user sees the (partial)
+    // answer prose, not the raw {"actions":...} protocol wrapper.
+    if let Some(answer) = recover_answer_field(chat) {
+        if !answer.trim().is_empty() {
+            return answer;
+        }
+    }
     let trimmed = chat.trim();
     if trimmed.is_empty() {
         "Reached the step or size limit before completing the task.".into()
     } else {
         trimmed.to_string()
     }
+}
+
+// recover_answer_field pulls the text of an "answer" string field out of a reply
+// whose JSON did not parse. It scans to the first "answer" key and decodes the
+// JSON string that follows, stopping at the closing quote or at end-of-input — so
+// a string truncated mid-value yields what was received rather than nothing.
+fn recover_answer_field(chat: &str) -> Option<String> {
+    let key = "\"answer\"";
+    let after_key = &chat[chat.find(key)? + key.len()..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let mut chars = after_colon.trim_start().strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out), // string closed cleanly
+            '\\' => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        out.push(ch);
+                    }
+                }
+                Some(other) => out.push(other), // unknown escape: keep the char
+                None => break,                  // truncated mid-escape
+            },
+            _ => out.push(c),
+        }
+    }
+    // Truncated before the closing quote — return the partial text.
+    (!out.is_empty()).then_some(out)
 }
 
 // find_answer walks a JSON value for the first non-empty "answer" string.
@@ -1101,6 +1148,27 @@ mod tests {
     #[test]
     fn salvage_of_empty_reply_is_nonempty() {
         assert!(!salvage_answer("   ").is_empty());
+    }
+
+    // A long final answer truncated by the token limit leaves an unbalanced
+    // envelope that neither decodes nor whole-parses. Salvage must still surface
+    // the answer prose, never the raw {"actions":...} wrapper.
+    #[test]
+    fn salvage_recovers_a_truncated_final_answer() {
+        let truncated =
+            r#"{"actions":[{"action":"final","content":{"answer":"**HWaaS** is Hardware as a Service, a model where"#;
+        assert!(decode_model_envelopes(truncated).is_err());
+        let got = salvage_answer(truncated);
+        assert_eq!(got, "**HWaaS** is Hardware as a Service, a model where");
+        assert!(!got.contains("\"actions\""), "raw envelope leaked: {got}");
+    }
+
+    // Recovery decodes JSON string escapes in the truncated answer.
+    #[test]
+    fn salvage_recovers_answer_with_escapes() {
+        let truncated =
+            r#"{"actions":[{"action":"final","content":{"answer":"line1\nline2 \"q\" tail"#;
+        assert_eq!(salvage_answer(truncated), "line1\nline2 \"q\" tail");
     }
 
     // A proper final envelope still decodes normally — salvage is a fallback,
