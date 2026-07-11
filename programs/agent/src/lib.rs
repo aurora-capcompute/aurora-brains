@@ -244,12 +244,18 @@ fn run_agent() -> anyhow::Result<()> {
         let chat = chat_within_budget(&mut messages)?;
         let envelopes = match decode_model_envelopes(&chat) {
             Ok(envelopes) => envelopes,
-            // The reply didn't parse as an action envelope — most often the
-            // model answered directly in prose, judging no tool was needed
-            // (occasionally a truncated batch). That reply is still the answer:
-            // end the run with it rather than failing the process. This turn's
-            // LLM call is already journaled, so a resume replays this salvage.
-            Err(_) => {
+            // The reply didn't parse as an action envelope. A prose answer, or a
+            // truncated final carrying a recoverable "answer", is still the answer:
+            // end the run with it via wrap_up rather than failing the process —
+            // this turn's LLM call is journaled, so a resume replays the salvage.
+            // But a botched/truncated TOOL batch (looks like a batch, no
+            // recoverable answer) must NOT be salvaged: publishing its raw
+            // {"actions":...} text would leak protocol as the answer. Leave the
+            // savepoint open and fail so the turn re-drives and the model retries.
+            Err(e) => {
+                if looks_like_tool_batch(&chat) && recover_answer_field(&chat).is_none() {
+                    return Err(e);
+                }
                 turn.commit()?;
                 return wrap_up(&chat);
             }
@@ -552,11 +558,25 @@ fn salvage_answer(chat: &str) -> String {
         }
     }
     let trimmed = chat.trim();
-    if trimmed.is_empty() {
+    // A reply that still looks like a (botched/truncated) tool batch but yielded
+    // no recoverable answer above must not be echoed verbatim — that would publish
+    // raw {"actions":...} protocol text as the answer. Fall back to the note.
+    if trimmed.is_empty() || looks_like_tool_batch(trimmed) {
         "Reached the step or size limit before completing the task.".into()
     } else {
         trimmed.to_string()
     }
+}
+
+// looks_like_tool_batch reports whether a reply's JSON region still carries an
+// "action"/"actions" key — the shape of a tool-call batch rather than a prose
+// reply. A botched or truncated batch is kept out of the salvage path so its raw
+// {"actions":...} protocol text is never published as the answer; a prose reply
+// (no such key) or a truncated final (recovered earlier by its "answer") is not
+// affected.
+fn looks_like_tool_batch(chat: &str) -> bool {
+    let region = extract_json_region(chat);
+    region.contains("\"action\"") || region.contains("\"actions\"")
 }
 
 // recover_answer_field pulls the text of an "answer" string field out of a reply
@@ -1034,7 +1054,9 @@ fn abbreviated_json(value: &Value, limit: usize) -> String {
     if s.len() <= limit {
         s
     } else {
-        format!("{}[...]", &s[..limit])
+        // Clamp on a char boundary: a fixed byte slice would panic on multi-byte
+        // UTF-8 in a model-authored value, and this runs while building an error.
+        format!("{}[...]", truncate_bytes(&s, limit))
     }
 }
 
@@ -1090,7 +1112,9 @@ fn progress_summary(action: &str, content: &Value) -> String {
         if let Some(s) = fields.get("message").and_then(|v| v.as_str()) {
             if !s.is_empty() {
                 let truncated = if s.len() > 80 {
-                    format!("{}…", &s[..80])
+                    // Char-boundary clamp: &s[..80] would panic on multi-byte
+                    // UTF-8 in a model-authored message.
+                    format!("{}…", truncate_bytes(s, 80))
                 } else {
                     s.to_string()
                 };
@@ -1179,6 +1203,19 @@ mod tests {
         let truncated =
             r#"{"actions":[{"action":"final","content":{"answer":"line1\nline2 \"q\" tail"#;
         assert_eq!(salvage_answer(truncated), "line1\nline2 \"q\" tail");
+    }
+
+    // A botched/truncated TOOL batch carrying no recoverable "answer" must not be
+    // salvaged verbatim — echoing its raw {"actions":...} text would leak protocol
+    // as the answer. It is flagged as a tool batch and salvages to the note.
+    #[test]
+    fn salvage_does_not_leak_a_botched_tool_batch() {
+        let botched =
+            r#"{"actions":[{"action":"core.internet","content":{"method":"GET","url":"http://ex"#;
+        assert!(decode_model_envelopes(botched).is_err());
+        assert!(looks_like_tool_batch(botched));
+        let got = salvage_answer(botched);
+        assert!(!got.contains("\"action\""), "protocol leaked: {got}");
     }
 
     // The chat request carries a completion-token cap so a long final answer is

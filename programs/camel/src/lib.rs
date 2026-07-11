@@ -42,6 +42,15 @@ After receiving observations, either request more tools or return exactly one te
 {\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\",\"retry_seconds\":60}}]} to undo the registered effects and retry the task after the delay (omit retry_seconds to undo and stop); abort reasons are not substituted.\n\
 Never combine a terminal action with tool calls in the same actions array.";
 
+// MAX_STEPS is a hard cap on agentic turns; the last turn is forced to a final
+// answer instead of looping forever. MAX_COMPLETION_TOKENS caps each model reply
+// so a long final answer is not truncated by a smaller provider default. Both
+// mirror programs/agent (camel keeps none of agent's compaction machinery).
+const MAX_STEPS: u32 = 16;
+const MAX_COMPLETION_TOKENS: u32 = 4096;
+
+const FINAL_DIRECTIVE: &str = "You have reached this run's step limit. Reply now with EXACTLY one final action and no tool calls: {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\"}}]}. Base the answer on what you already have; the answer may reference $N.";
+
 // -- Data structures --
 
 #[derive(Serialize)]
@@ -74,6 +83,9 @@ struct LlmRequest<'a> {
     // family; the host routes on it and strips it from the provider request.
     operation: &'static str,
     messages: &'a [Message],
+    // Cap the reply so a long final answer is not truncated by the provider's
+    // default; forwarded verbatim to the provider by the driver.
+    max_completion_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +177,9 @@ fn run_camel() -> anyhow::Result<()> {
     // in `messages`.
     let mut store = VarStore::default();
 
+    let mut step: u32 = 0;
     loop {
+        step += 1;
         // Each agentic turn — one LLM call plus the tool calls it requests —
         // is a savepoint: sys.begin here, sys.commit at the turn's end. If the
         // turn breaks mid-way (a malformed model reply, an unknown variable
@@ -174,6 +188,12 @@ fn run_camel() -> anyhow::Result<()> {
         // live — including the LLM call, giving the model a fresh chance —
         // instead of deterministically replaying the broken completion forever.
         let turn = sdk::savepoint()?;
+        // Bound the run: at the step budget, demand one final action this turn and
+        // finish instead of looping forever. A minimal step cap mirroring
+        // programs/agent (camel keeps none of agent's compaction machinery).
+        if step >= MAX_STEPS {
+            return finalize(turn, &mut messages, &store);
+        }
         let chat = llm_chat(&messages)?;
         let envelopes = match decode_model_envelopes(&chat) {
             Ok(envelopes) => envelopes,
@@ -182,8 +202,15 @@ fn run_camel() -> anyhow::Result<()> {
             // that reply as the answer rather than failing the process, routing
             // it through the same $N substitution a proper final gets so the
             // quarantine still holds. The turn's LLM call is journaled, so a
-            // resume replays this salvage.
-            Err(_) => {
+            // resume replays this salvage. But a botched/truncated TOOL batch
+            // (looks like a batch, no clean final) must NOT be salvaged:
+            // publishing its raw {"actions":...} text would leak protocol as the
+            // answer. Leave the savepoint open and fail so the turn re-drives and
+            // the model retries.
+            Err(e) => {
+                if looks_like_tool_batch(&chat) {
+                    return Err(e);
+                }
                 let answer = salvage(&chat, &store)?;
                 turn.commit()?;
                 return sdk::output(&FinishArgs { answer });
@@ -377,6 +404,41 @@ fn salvage(chat: &str, store: &VarStore) -> anyhow::Result<String> {
     }
 }
 
+/// finalize forces the run to a close at the step budget: it asks the model for
+/// exactly one final action and publishes that answer. If the model instead
+/// returns tools or a botched batch, a neutral note is published rather than its
+/// raw {"actions":...} protocol text; a plain prose reply is salvaged. A minimal
+/// mirror of programs/agent's finalize, without the compaction machinery.
+fn finalize(
+    turn: sdk::Savepoint,
+    messages: &mut Vec<Message>,
+    store: &VarStore,
+) -> anyhow::Result<()> {
+    messages.push(Message {
+        role: "user".into(),
+        content: FINAL_DIRECTIVE.into(),
+    });
+    let chat = llm_chat(messages)?;
+    // Resolve any $N in a clean final before committing, so a bad final reopens
+    // the turn on resume instead of wedging after the commit.
+    if let Ok(envelopes) = decode_model_envelopes(&chat) {
+        if let Some(idx) = envelopes.iter().position(|e| e.action == "final") {
+            let answer = final_answer(&envelopes[idx].content, store)?;
+            turn.commit()?;
+            return sdk::output(&FinishArgs { answer });
+        }
+    }
+    // No clean final: salvage a prose reply, but never echo a tool batch's raw
+    // protocol text as the answer.
+    let answer = if looks_like_tool_batch(&chat) {
+        "Reached the step limit before completing the task.".to_string()
+    } else {
+        salvage(&chat, store)?
+    };
+    turn.commit()?;
+    sdk::output(&FinishArgs { answer })
+}
+
 /// substitute_compensate_args resolves $N references in a compensate
 /// registration's "args" only. The undo's "name" is control flow — it stays
 /// exactly as the model wrote it, so quarantined data can never choose which
@@ -507,14 +569,39 @@ fn abbreviated_json(value: &Value, limit: usize) -> String {
     if s.len() <= limit {
         s
     } else {
-        format!("{}[...]", &s[..limit])
+        // Clamp on a char boundary: a fixed byte slice would panic on multi-byte
+        // UTF-8 in a model-authored value, and this runs while building an error.
+        format!("{}[...]", truncate_bytes(&s, limit))
     }
+}
+
+// truncate_bytes clamps s to at most max bytes, backing up to the nearest char
+// boundary so the result stays valid UTF-8. Mirrors programs/agent.
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// looks_like_tool_batch reports whether a reply's JSON region still carries an
+// "action"/"actions" key — the shape of a tool-call batch rather than a prose
+// reply. A botched or truncated batch is kept out of the salvage path so its raw
+// {"actions":...} protocol text is never published as the answer.
+fn looks_like_tool_batch(chat: &str) -> bool {
+    let region = extract_json_region(chat);
+    region.contains("\"action\"") || region.contains("\"actions\"")
 }
 
 fn llm_chat(messages: &[Message]) -> anyhow::Result<String> {
     let req = LlmRequest {
         operation: "chat",
         messages,
+        max_completion_tokens: MAX_COMPLETION_TOKENS,
     };
     let args = serde_json::to_value(&req)?;
     let response = sdk::dispatch(&Call {
@@ -609,6 +696,18 @@ mod tests {
     fn salvage_of_empty_reply_is_nonempty() {
         let store = VarStore::default();
         assert!(!salvage("   ", &store).unwrap().is_empty());
+    }
+
+    // A reply that looks like a (botched/truncated) tool batch is flagged so it
+    // stays out of the salvage path — its raw {"actions":...} text must never
+    // become the answer. A prose reply is not flagged.
+    #[test]
+    fn looks_like_tool_batch_flags_a_batch_not_prose() {
+        let botched =
+            r#"{"actions":[{"action":"core.internet","content":{"method":"GET","url":"http://ex"#;
+        assert!(decode_model_envelopes(botched).is_err());
+        assert!(looks_like_tool_batch(botched));
+        assert!(!looks_like_tool_batch("Here is the answer in prose."));
     }
 
     // -- substitute_compensate_args --

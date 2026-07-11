@@ -137,7 +137,12 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
     mem.free();
     let response_mem = Memory::find(response_offset)
         .ok_or_else(|| anyhow::anyhow!("decode host response: invalid offset"))?;
-    let decoded = wire::decode_response(&response_mem.to_vec())
+    // Copy the response bytes out, then free the host's response block. Memory
+    // (unlike ManagedMemory) has no Drop, so without this the response block leaks
+    // on every syscall — the mirror of the request `mem.free()` above.
+    let response_bytes = response_mem.to_vec();
+    response_mem.free();
+    let decoded = wire::decode_response(&response_bytes)
         .map_err(|e| anyhow::anyhow!("decode host response: {}", e))?;
 
     let status = match decoded.status {
