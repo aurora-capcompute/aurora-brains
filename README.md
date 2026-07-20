@@ -70,8 +70,10 @@ Cross‑cutting features every program gets from the **SDK** (`sdk/`, the
 - **Yield / resume** — pause on outside work (approval, timer) via the yield sentinel.
 - **Declarative interface manifests** — every program ships an `interface.json` the
   host reads without executing.
-- **Cross‑language ABI pinning** — the wire codec (`sdk/src/wire.rs`) is verified
-  against the Go host's golden fixtures, so guest and host agree byte‑for‑byte.
+- **Cross‑language ABI pinning** — the envelope is JSON (ABI v4), so guest and
+  host serialize the same field set with their standard libraries; agreement is
+  proven end‑to‑end by `aurora-capcompute`'s suite, which builds these programs
+  and drives them through the real Go host.
 
 ## Every program ships a manifest
 
@@ -143,8 +145,8 @@ run/deploy step in *this* repo — a program only runs inside the kernel.
 Cargo.toml           the workspace: members = sdk, programs/{agent,camel,echo}
 sdk/                 aurora-program-sdk — the syscall boundary every program uses
   src/lib.rs           dispatch, savepoints, input/output/log, capabilities,
-                       compensate/abort, now/random (ABI v3)
-  src/wire.rs          the proto3 ABI-v3 codec (+ golden-fixture interop tests)
+                       compensate/abort, now/random, and the ABI-v4 JSON
+                       envelope (ABI v4)
 programs/
   echo/              smallest program — no LLM, input → output
   agent/             general-purpose tool-calling LLM loop (adds lol_html for HTML→text)

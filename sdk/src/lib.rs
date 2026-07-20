@@ -1,9 +1,8 @@
 //! The Aurora program SDK: everything a guest program needs to speak the
 //! syscall boundary, so a program crate contains only cognition. It owns the
-//! ABI v3 wire codec ([`wire`]), the single `extism:host/compute` syscall
-//! import, and the dispatch protocol — result/failed observations, the yield
-//! sentinel, [`savepoint`]s, and savepoint-bracketed "hard" calls
-//! ([`dispatch_hard`]).
+//! ABI v4 JSON envelope, the single `extism:host/compute` syscall import, and
+//! the dispatch protocol — result/failed observations, the yield sentinel,
+//! [`savepoint`]s, and savepoint-bracketed "hard" calls ([`dispatch_hard`]).
 //!
 //! On top of that it owns the typed plumbing a program would otherwise
 //! re-implement by hand: [`input`]/[`output`] for the process's payloads, [`log`]
@@ -20,7 +19,30 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub mod wire;
+/// The guest-to-host envelope, mirroring capcompute's `sys.Syscall`.
+#[derive(Serialize)]
+struct SyscallEnvelope<'a> {
+    abi: u32,
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<&'a Value>,
+}
+
+/// The host-to-guest envelope, mirroring capcompute's `sys.SyscallResult`.
+/// Every field but `status` is omitted when empty, so all of them default.
+#[derive(Deserialize, Default)]
+struct ResponseEnvelope {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    labels: Vec<String>,
+}
 
 #[link(wasm_import_module = "extism:host/compute")]
 extern "C" {
@@ -28,10 +50,10 @@ extern "C" {
 }
 
 /// Syscall ABI this SDK speaks (sys.ABIVersion in capcompute); the host
-/// rejects mismatches with code "bad_abi". Since v3 the envelope is protobuf
-/// ([`wire`], mirroring capcompute's sys/wire); args and results stay JSON
-/// payloads inside it.
-pub const ABI_VERSION: u32 = 3;
+/// rejects mismatches with code "bad_abi". Since v4 the envelope is JSON, so
+/// args and results nest directly inside it — v3's protobuf envelope needed a
+/// hand-rolled codec on each side of the boundary to carry the same fields.
+pub const ABI_VERSION: u32 = 4;
 
 /// Reserved savepoint markers (sys.SyscallBegin/sys.SyscallCommit in
 /// capcompute). They carry no side effect; the host journals them and uses an
@@ -70,8 +92,8 @@ pub const SYS_RANDOM: &str = "sys.random";
 /// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
 /// recoverable observations the program can react to; "yield" never reaches the
 /// caller as a response (it surfaces as [`YieldedError`]), and "unspecified"
-/// covers a status the host left unset. These are the decoded-string mirror of
-/// the wire status codes ([`wire::STATUS_RESULT`] and friends).
+/// covers a status the host left unset. These are the status strings the
+/// envelope carries verbatim (capcompute's sys.SyscallStatus).
 pub const STATUS_RESULT: &str = "result";
 pub const STATUS_YIELD: &str = "yield";
 pub const STATUS_FAILED: &str = "failed";
@@ -121,17 +143,12 @@ pub struct HostResponse {
 /// a response with status "failed" (recoverable by default: the program can
 /// react); a host yield is surfaced as [`YieldedError`].
 pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
-    let args = match &c.args {
-        Some(value) => {
-            serde_json::to_vec(value).map_err(|e| anyhow::anyhow!("encode call args: {}", e))?
-        }
-        None => Vec::new(),
-    };
-    let raw = wire::encode_syscall(&wire::Syscall {
+    let raw = serde_json::to_vec(&SyscallEnvelope {
         abi: ABI_VERSION,
-        name: c.name.clone(),
-        args,
-    });
+        name: &c.name,
+        args: c.args.as_ref(),
+    })
+    .map_err(|e| anyhow::anyhow!("encode syscall: {}", e))?;
     let mem = Memory::from_bytes(&raw)?;
     let response_offset = unsafe { syscall(mem.offset()) };
     mem.free();
@@ -142,28 +159,21 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
     // on every syscall — the mirror of the request `mem.free()` above.
     let response_bytes = response_mem.to_vec();
     response_mem.free();
-    let decoded = wire::decode_response(&response_bytes)
+    let decoded: ResponseEnvelope = serde_json::from_slice(&response_bytes)
         .map_err(|e| anyhow::anyhow!("decode host response: {}", e))?;
 
-    let status = match decoded.status {
-        wire::STATUS_RESULT => STATUS_RESULT,
-        wire::STATUS_YIELD => STATUS_YIELD,
-        wire::STATUS_FAILED => STATUS_FAILED,
-        _ => STATUS_UNSPECIFIED,
-    };
-    let result = if decoded.result.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_slice(&decoded.result)
-                .map_err(|e| anyhow::anyhow!("decode result payload: {}", e))?,
-        )
-    };
     let response = HostResponse {
-        abi: decoded.abi,
-        status: status.to_string(),
+        // The host omits its own version from the response; a mismatch would
+        // already have come back as a "bad_abi" failure, so a decoded response
+        // is by construction from a host speaking this ABI.
+        abi: ABI_VERSION,
+        status: if decoded.status.is_empty() {
+            STATUS_UNSPECIFIED.to_string()
+        } else {
+            decoded.status
+        },
         code: decoded.code,
-        result,
+        result: decoded.result,
         message: decoded.message,
         labels: decoded.labels,
     };

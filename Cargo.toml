@@ -7,7 +7,7 @@ members = ["sdk", "programs/agent", "programs/camel", "programs/echo"]
 # write src/lib.rs and interface.json, add the member here.
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [workspace.dependencies]
