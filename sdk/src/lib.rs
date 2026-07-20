@@ -63,7 +63,7 @@ pub const ABI_VERSION: u32 = 4;
 pub const SYS_BEGIN: &str = "sys.begin";
 pub const SYS_COMMIT: &str = "sys.commit";
 
-/// Reserved names for the guest↔host protocol plumbing the kernel handles
+/// Reserved names for the guest↔host protocol plumbing the processor handles
 /// itself (not a dispatcher): fetch this run's input ([`input`]), publish its
 /// result ([`output`]), and emit a progress line ([`log`]).
 pub const SYS_INPUT: &str = "sys.input";
@@ -82,7 +82,7 @@ pub const SYS_ABORT: &str = "sys.abort";
 /// compensations run — newest first — only if the section later aborts.
 pub const SYS_COMPENSATE: &str = "sys.compensate";
 
-/// Reserved names for the journaled world sources: the kernel pins the guest's
+/// Reserved names for the journaled world sources: the processor pins the guest's
 /// ambient clock and RNG for determinism, so real time ([`now`]) and entropy
 /// ([`random`]) are syscalls — produced host-side on first execution, journaled,
 /// and replayed verbatim on resume.
@@ -316,7 +316,7 @@ pub fn abort(reason: &str, retry_seconds: Option<u64>) -> anyhow::Result<()> {
 
 /// now reads the host's wall clock in unix milliseconds. The value is journaled
 /// on first execution and replayed verbatim on resume, so it is safe anywhere in
-/// deterministic guest code — unlike an ambient clock, which the kernel pins.
+/// deterministic guest code — unlike an ambient clock, which the processor pins.
 pub fn now() -> anyhow::Result<i64> {
     let response = dispatch(&Call {
         name: SYS_NOW.into(),

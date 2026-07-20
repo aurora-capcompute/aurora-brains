@@ -2,7 +2,7 @@
 
 **The "brains" of Aurora agents — the actual decision‑making code.** This is a Rust
 workspace of small programs that each compile to a WebAssembly (`wasm32-wasip1`)
-module and run as a sandboxed agent inside the Aurora kernel.
+module and run as a sandboxed agent inside the capcompute processor.
 
 > The repo is still named `aurora-brains`; its contents are Aurora **programs**
 > (a rename to `aurora-programs` is pending).
@@ -16,7 +16,7 @@ module and run as a sandboxed agent inside the Aurora kernel.
 
 A **program** is the cognition of one agent — its LLM loop and decision logic. It
 runs as a deterministic Wasm guest inside the
-[capcompute](https://github.com/aurora-capcompute/capcompute) kernel and holds
+[capcompute](https://github.com/aurora-capcompute/capcompute) processor and holds
 **zero ambient authority**: it can't read the clock, generate randomness, make a
 network call, or even call an LLM on its own. It can only *ask* the host to do those
 things through **journaled syscalls** — each one validated, permission‑checked,
@@ -39,7 +39,7 @@ do anything the host didn't grant.
  aurora-capcompute    aurora-dispatchers     ← orchestration runtime + capability drivers
    └──────────┬──────────┘
               │  both built on
-         capcompute                          ← the kernel (the foundation)
+         capcompute                          ← the processor (the foundation)
 
    aurora-brains  ◀── YOU ARE HERE (the Wasm agent "programs" that run inside)
 ```
@@ -124,7 +124,7 @@ cargo test --workspace
 drop them into [aurora-dist](https://github.com/aurora-capcompute/aurora-dist)'s
 `-programs` directory, run the server, and `spawn` a process with
 [aurora-cli](https://github.com/aurora-capcompute/aurora-cli). There is no
-run/deploy step in *this* repo — a program only runs inside the kernel.
+run/deploy step in *this* repo — a program only runs inside the processor.
 
 ## Example: writing a new program
 
@@ -137,7 +137,7 @@ run/deploy step in *this* repo — a program only runs inside the kernel.
    yield sentinel and return `{"status":"yielded"}`.
 4. Write `interface.json` (see `programs/echo/interface.json` for the minimal shape).
 5. Keep it **deterministic** — no clocks, randomness, or I/O outside the SDK's
-   syscalls. The kernel pins the ambient sources and the journal replays the rest.
+   syscalls. The processor pins the ambient sources and the journal replays the rest.
 
 ## Project layout
 
@@ -165,7 +165,7 @@ text). Nothing else.
 
 ## Related repos
 
-- [capcompute](https://github.com/aurora-capcompute/capcompute) — the kernel these programs run inside
+- [capcompute](https://github.com/aurora-capcompute/capcompute) — the processor these programs run inside
 - [aurora-capcompute](https://github.com/aurora-capcompute/aurora-capcompute) — the runtime that manages them as processes
 - [aurora-dispatchers](https://github.com/aurora-capcompute/aurora-dispatchers) — the drivers behind the capabilities they call
 - [aurora-dist](https://github.com/aurora-capcompute/aurora-dist) — the server you drop the built programs into

@@ -2,7 +2,7 @@
 //! prompt-injection-resilient after CaMeL (Debenedetti et al. 2025,
 //! "Defeating Prompt Injections by Design") and Willison's dual-LLM pattern.
 //!
-//! The kernel already mediates every capability and tracks data-flow labels
+//! The processor already mediates every capability and tracks data-flow labels
 //! host-side. This program supplies the missing guest half: the planning model
 //! NEVER reads raw tool output. Each successful call's result is held in a
 //! guest-side variable store ([`quarantine`]) as `$1`, `$2`, ...; the model
