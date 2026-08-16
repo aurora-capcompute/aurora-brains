@@ -721,9 +721,8 @@ fn maybe_offload_internet(
 }
 
 // offload_note frames the offloaded observation for the model: it is a pointer,
-// not the content, and the way to read on is core.memory search — never get,
-// which returns the whole large value and re-floods context. When the body
-// couldn't be stored, it says only this summary + excerpt remains.
+// not the content, and the way to read on is core.scratch search — never get,
+// which returns the whole large value and re-floods context.
 fn offload_note(bytes: usize, stored_key: Option<&str>) -> String {
     match stored_key {
         Some(key) => format!(
