@@ -40,8 +40,6 @@ struct ResponseEnvelope {
     result: Option<Value>,
     #[serde(default)]
     message: String,
-    #[serde(default)]
-    labels: Vec<String>,
 }
 
 #[link(wasm_import_module = "extism:host/compute")]
@@ -134,9 +132,6 @@ pub struct HostResponse {
     pub code: String,
     pub result: Option<Value>,
     pub message: String,
-    /// Provenance labels of the result — where this data came from. Treat
-    /// content labelled untrusted as untrusted.
-    pub labels: Vec<String>,
 }
 
 /// dispatch sends one syscall and returns its outcome. Failures come back as
@@ -175,7 +170,6 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
         code: decoded.code,
         result: decoded.result,
         message: decoded.message,
-        labels: decoded.labels,
     };
     match response.status.as_str() {
         STATUS_RESULT | STATUS_FAILED => Ok(response),
@@ -370,13 +364,17 @@ pub fn log(message: &str) {
 }
 
 /// Capability is one tool the host has granted this run — the guest's decoded
-/// view of capcompute's `sys.Capability`. A program reads `name`/`description`/
-/// `input_schema` to build its tool menu, and may consult `hidden` (keep a
-/// dispatchable tool off that menu). A capability names an ADT family whose
-/// operations are cases of `input_schema` (a `oneOf` discriminated by an
-/// `operation`/`method` field), so a leaf grant is one tool, not several.
-/// Data-flow provenance is per call, not per capability: read [`HostResponse`]'s
-/// `labels` on each result. Decode-only: the host owns the record. How an effect
+/// view of the host's capability descriptor. A program reads
+/// `name`/`description`/`input_schema` to build its tool menu, and may consult
+/// `hidden` (keep a dispatchable tool off that menu). A capability names an ADT
+/// family whose operations are cases of `input_schema` (a `oneOf` discriminated
+/// by an `operation`/`method` field), so a leaf grant is one tool, not several.
+///
+/// Data-flow provenance is deliberately absent. The host tracks which source
+/// classes a run has observed and refuses the calls they bar, but it does not
+/// tell the guest: the taxonomy is the map a compromised program would use to
+/// find a route out the policy has not marked, so it stays host-side and a
+/// refusal is all the guest ever sees. Decode-only: the host owns the record. How an effect
 /// is undone is not capability metadata — the guest registers concrete undos
 /// with [`compensate`].
 #[derive(Debug, Clone, Default, Deserialize)]
