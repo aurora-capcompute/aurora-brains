@@ -15,8 +15,8 @@
 //! next action — it is data in a store, not words in the planner's context.
 //!
 //! Everything else mirrors `programs/agent`: the same conversation/action
-//! protocol, per-turn savepoints, hard calls, compensation registration, and
-//! terminal final/abort actions.
+//! protocol, per-turn savepoints, hard calls, and terminal final/abort
+//! actions.
 
 use aurora_program_sdk as sdk;
 use aurora_program_sdk::{Call, Capability};
@@ -36,7 +36,6 @@ You never see tool output. A successful call's result is stored as a guest-side 
 To use a stored result, write the literal string \"$N\" inside a later tool call's string arguments or in your final answer; the executor substitutes the stored value after you have chosen the action. A string that is exactly \"$N\" becomes the stored JSON value itself; \"$N\" inside a longer string becomes its text rendering (strings verbatim, other values compact JSON). Write \"$$\" for a literal \"$\". Referencing a variable that does not exist fails the turn.\n\
 A failed tool call is recoverable by default: use other sources, retry when appropriate, or explain the limitation.\n\
 Add \"hard\": true to a tool call only when its failure must abort the process so a later resume re-executes it (for example, a state-changing step the process cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
-To make a completed side effect undoable, register its exact inverse right after observing its result: {\"action\":\"compensate\",\"content\":{\"name\":\"<tool>\",\"args\":{...}}}; the args may reference $N, the name may not. The host only records it; registered inverses run, newest first, if you later abort.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish — the answer may reference $N and is substituted before delivery, or\n\
 {\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\",\"retry_seconds\":60}}]} to undo the registered effects and retry the task after the delay (omit retry_seconds to undo and stop); abort reasons are not substituted.\n\
@@ -225,11 +224,11 @@ fn run_camel() -> anyhow::Result<()> {
 
         if !has_tool {
             if let Some(idx) = first_abort_idx {
-                // The model gave up on the task and asked to roll it back: the
-                // host executes the compensations this run registered, newest
-                // first, then retries after the given delay or stops. Commit
-                // the turn first so no section is left open — a model abort
-                // rolls back (and retries) the whole task, not just this turn.
+                // The model gave up and asked to abandon the task: the host
+                // forks the journal at the open begin and retries after the
+                // given delay, or stops. Commit the turn first so no section is
+                // left open — a model abort re-runs the whole task, not just
+                // this turn.
                 // The reason is model-authored control metadata; it is passed
                 // through unsubstituted so quarantined data never rides out on
                 // the abort channel.
@@ -266,10 +265,7 @@ fn run_camel() -> anyhow::Result<()> {
             if envelope.action == "final" {
                 continue;
             }
-            // "compensate" is protocol, not a menu tool: it registers a deferred
-            // undo with the host (validated there against the grant set).
-            let is_compensate = envelope.action == "compensate";
-            if !is_compensate && !allowed.contains(envelope.action.as_str()) {
+            if !allowed.contains(envelope.action.as_str()) {
                 anyhow::bail!(
                     "action {} requested unavailable capability {:?}",
                     i,
@@ -280,23 +276,13 @@ fn run_camel() -> anyhow::Result<()> {
                 anyhow::bail!("capability action {} missing content", i);
             }
             // The CaMeL move: the model has already chosen the action and
-            // authored its args; only now does quarantined data flow in. For a
-            // compensate registration only the undo's args are substituted —
-            // its name is control flow and stays exactly as the model wrote it.
-            let args = if is_compensate {
-                substitute_compensate_args(&envelope.content, &store)?
-            } else {
-                substitute(&envelope.content, &store)?
-            };
+            // authored its args; only now does quarantined data flow in.
+            let args = substitute(&envelope.content, &store)?;
             // Progress lines stay content-free: substituted args may carry
             // quarantined data.
             sdk::log(&format!("⚙ {}", envelope.action));
             let tool_call = Call {
-                name: if is_compensate {
-                    sdk::SYS_COMPENSATE.into()
-                } else {
-                    envelope.action.clone()
-                },
+                name: envelope.action.clone(),
                 args: Some(args),
             };
             let response = if envelope.hard {
@@ -437,18 +423,6 @@ fn finalize(
     };
     turn.commit()?;
     sdk::output(&FinishArgs { answer })
-}
-
-/// substitute_compensate_args resolves $N references in a compensate
-/// registration's "args" only. The undo's "name" is control flow — it stays
-/// exactly as the model wrote it, so quarantined data can never choose which
-/// tool an undo dispatches.
-fn substitute_compensate_args(content: &Value, store: &VarStore) -> anyhow::Result<Value> {
-    let mut out = content.clone();
-    if let Some(args) = content.get("args") {
-        out["args"] = substitute(args, store)?;
-    }
-    Ok(out)
 }
 
 // -- Model reply decoding (mirrors programs/agent: same conversation/action
@@ -708,24 +682,6 @@ mod tests {
         assert!(decode_model_envelopes(botched).is_err());
         assert!(looks_like_tool_batch(botched));
         assert!(!looks_like_tool_batch("Here is the answer in prose."));
-    }
-
-    // -- substitute_compensate_args --
-
-    #[test]
-    fn compensate_substitution_touches_args_but_never_the_name() {
-        let store = store_with(&[json!("charge-123")]);
-        let content = json!({"name": "$1", "args": {"charge_id": "$1"}});
-        let got = substitute_compensate_args(&content, &store).unwrap();
-        assert_eq!(got, json!({"name": "$1", "args": {"charge_id": "charge-123"}}));
-    }
-
-    #[test]
-    fn compensate_substitution_without_args_is_a_passthrough() {
-        let store = VarStore::default();
-        let content = json!({"name": "payments.refund"});
-        let got = substitute_compensate_args(&content, &store).unwrap();
-        assert_eq!(got, content);
     }
 
     // -- model reply decoding (smoke: shared shape with programs/agent) --

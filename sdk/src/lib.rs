@@ -68,17 +68,10 @@ pub const SYS_INPUT: &str = "sys.input";
 pub const SYS_OUTPUT: &str = "sys.output";
 pub const SYS_LOG: &str = "sys.log";
 
-/// Reserved name for rolling a critical section back: instead of finishing
-/// with [`output`], [`abort`] asks the host to execute the compensations the
-/// guest registered with [`compensate`], newest first, and then retry the
-/// section after a delay (or stop). The backward counterpart of a crash
-/// resume: a host failure re-drives a process; sys.abort deliberately undoes it.
+/// Reserved name for abandoning the open critical section: instead of finishing
+/// with [`output`], [`abort`] forks the journal at the section's sys.begin and
+/// re-runs it from there, or stops. Nothing is undone — the section re-executes.
 pub const SYS_ABORT: &str = "sys.abort";
-
-/// Reserved name for registering an effect's undo: a deferred syscall the host
-/// journals (name + concrete args) but does not execute. Registered
-/// compensations run — newest first — only if the section later aborts.
-pub const SYS_COMPENSATE: &str = "sys.compensate";
 
 /// Reserved names for the journaled world sources: the processor pins the guest's
 /// ambient clock and RNG for determinism, so real time ([`now`]) and entropy
@@ -182,15 +175,11 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
 /// with [`savepoint`] and close it with [`Savepoint::commit`] once the zone has
 /// succeeded; *dropping it without committing* leaves the sys.begin open. A run
 /// that then fails is first re-driven by replay — a transient failure simply
-/// resumes and continues, and any [`compensate`] registration the failure cut
-/// short lands on the re-drive (registering an undo right after its effect is
-/// safe). A failure that re-drives without progress aborts the zone: the host
-/// executes the registered compensations newest-first before the process reports
-/// failed, and a retry forks right after the begin — re-executing the whole
-/// zone live, over rolled-back state. That drop-aborts behavior is the point —
-/// propagate an error out of the zone (with `?`) and the savepoint unwinds the
-/// run for you. Brackets have stack semantics; [`dispatch_hard`] wraps a single
-/// call this way.
+/// resumes and continues. A failure that re-drives without progress aborts the
+/// zone: the journal forks at the begin and the whole zone re-executes live.
+/// That drop-aborts behavior is the point — propagate an error out of the zone
+/// (with `?`) and the savepoint unwinds the run for you. Brackets have stack
+/// semantics; [`dispatch_hard`] wraps a single call this way.
 #[must_use = "a Savepoint aborts the process unless it is committed"]
 #[non_exhaustive]
 pub struct Savepoint {}
@@ -219,10 +208,10 @@ pub fn savepoint() -> anyhow::Result<Savepoint> {
 
 /// dispatch_hard brackets a single call in a [`savepoint`]. On success it commits
 /// and returns the result. On failure it leaves the begin open and returns an
-/// error that fails the process — a transient failure re-drives and re-executes the
-/// call; a deterministic one rolls the section back (any registered
-/// compensations run) and a retry forks right after the begin, re-executing
-/// under a new revision. A plain [`dispatch`] (the default, "soft") instead
+/// error that fails the process — a transient failure re-drives and re-executes
+/// the call; a deterministic one aborts the section, and a retry forks right at
+/// the begin, re-executing under a new revision. A plain [`dispatch`] (the
+/// default, "soft") instead
 /// records the failure for replay and lets the program react to it.
 pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
     let sp = savepoint()?;
@@ -267,35 +256,10 @@ pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// compensate registers an effect's undo, to run only if the section later
-/// aborts. It takes the same [`Call`] a [`dispatch`] does — the undo IS a
-/// syscall, validated against the grant set like any other; the only
-/// difference is when it runs. Build the args from the effect's result (e.g.
-/// the charge id a refund needs) and register immediately after the effect
-/// succeeds. Execution is deferred, so there is nothing to inspect on
-/// success; a rejected registration (an ungranted or malformed undo) is the
-/// error.
-pub fn compensate(c: &Call) -> anyhow::Result<()> {
-    let mut args = serde_json::json!({ "name": c.name });
-    if let Some(call_args) = &c.args {
-        args["args"] = call_args.clone();
-    }
-    let response = dispatch(&Call {
-        name: SYS_COMPENSATE.into(),
-        args: Some(args),
-    })?;
-    if response.status == STATUS_FAILED {
-        anyhow::bail!("register compensation {:?}: {}", c.name, response.message);
-    }
-    Ok(())
-}
-
-/// abort rolls the open critical section back instead of finishing with
-/// [`output`]: the host executes the compensations registered with
-/// [`compensate`] newest-first, journaling each. With `retry_seconds` the
-/// section then retries after that delay — the journal forks at the section's
-/// begin and the whole section re-executes fresh; without it the process stops
-/// as compensated. The guest returns after calling abort.
+/// abort abandons the open critical section instead of finishing with
+/// [`output`]. With `retry_seconds` the section retries after that delay — the
+/// journal forks at the section's begin and the whole section re-executes
+/// fresh; without it the process stops. The guest returns after calling abort.
 pub fn abort(reason: &str, retry_seconds: Option<u64>) -> anyhow::Result<()> {
     let mut args = serde_json::json!({ "reason": reason });
     if let Some(delay) = retry_seconds {
@@ -374,9 +338,7 @@ pub fn log(message: &str) {
 /// classes a run has observed and refuses the calls they bar, but it does not
 /// tell the guest: the taxonomy is the map a compromised program would use to
 /// find a route out the policy has not marked, so it stays host-side and a
-/// refusal is all the guest ever sees. Decode-only: the host owns the record. How an effect
-/// is undone is not capability metadata — the guest registers concrete undos
-/// with [`compensate`].
+/// refusal is all the guest ever sees. Decode-only: the host owns the record.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Capability {
     pub name: String,

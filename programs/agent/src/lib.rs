@@ -15,7 +15,6 @@ Use only the tools listed below. Match each tool's input JSON schema exactly.\n\
 You may request multiple independent tool calls in one turn. The host executes them sequentially and returns one aggregated observation array.\n\
 Each observation has status \"result\" with content or status \"failed\" with an error. A failed tool call is recoverable by default: use other sources, retry when appropriate, or explain the limitation.\n\
 Add \"hard\": true to a tool call only when its failure must abort the process so a later resume re-executes it (for example, a state-changing step the process cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
-To make a completed side effect undoable, register its exact inverse right after observing its result: {\"action\":\"compensate\",\"content\":{\"name\":\"<tool>\",\"args\":{...}}}. The host only records it; registered inverses run, newest first, if you later abort.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish, or\n\
 {\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\",\"retry_seconds\":60}}]} to undo the registered effects and retry the task after the delay (omit retry_seconds to undo and stop).\n\
@@ -269,11 +268,11 @@ fn run_agent() -> anyhow::Result<()> {
 
         if !has_tool {
             if let Some(idx) = first_abort_idx {
-                // The model gave up on the task and asked to roll it back: the
-                // host executes the compensations this run registered, newest
-                // first, then retries after the given delay or stops. Commit
-                // the turn first so no section is left open — a model abort
-                // rolls back (and retries) the whole task, not just this turn.
+                // The model gave up and asked to abandon the task: the host
+                // forks the journal at the open begin and retries after the
+                // given delay, or stops. Commit the turn first so no section is
+                // left open — a model abort re-runs the whole task, not just
+                // this turn.
                 let reason = envelopes[idx]
                     .content
                     .get("reason")
@@ -303,10 +302,7 @@ fn run_agent() -> anyhow::Result<()> {
             if envelope.action == "final" {
                 continue;
             }
-            // "compensate" is protocol, not a menu tool: it registers a deferred
-            // undo with the host (validated there against the grant set).
-            let is_compensate = envelope.action == "compensate";
-            if !is_compensate && !allowed.contains(envelope.action.as_str()) {
+            if !allowed.contains(envelope.action.as_str()) {
                 anyhow::bail!(
                     "action {} requested unavailable capability {:?}",
                     i,
@@ -318,11 +314,7 @@ fn run_agent() -> anyhow::Result<()> {
             }
             emit_progress(&envelope.action, &envelope.content);
             let tool_call = Call {
-                name: if is_compensate {
-                    sdk::SYS_COMPENSATE.into()
-                } else {
-                    envelope.action.clone()
-                },
+                name: envelope.action.clone(),
                 args: Some(envelope.content.clone()),
             };
             let mut response = if envelope.hard {
