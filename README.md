@@ -23,7 +23,7 @@ things through **journaled syscalls** — each one validated, permission‑check
 recorded, replayable, and reversible by the host. A running program is a **process**.
 
 Why bother? Because it lets you run LLM‑driven agent logic **safely, deterministically,
-and auditably**, with crash‑recovery and undo built in — the agent literally cannot
+and auditably**, with crash‑recovery built in — the agent literally cannot
 do anything the host didn't grant.
 
 ## Where this fits in the Aurora system
@@ -55,7 +55,7 @@ is the code that runs.
 | Program | What it is |
 | --- | --- |
 | **`echo`** | The smallest possible program — no LLM, just input → output (returns `"pong"` when empty). The minimal example to copy. |
-| **`agent`** | The general‑purpose agent: a tool‑calling LLM loop over whatever capabilities its manifest grants. Handles multi‑action turns, per‑turn savepoints, rollback, stripping fetched web pages to text, transcript compaction, and offloading big reads to scratch memory. |
+| **`agent`** | The general‑purpose agent: a tool‑calling LLM loop over whatever capabilities its manifest grants. Handles multi‑action turns, per‑turn savepoints, stripping fetched web pages to text, transcript compaction, and offloading big reads to scratch memory. |
 | **`camel`** | Same protocol as `agent`, but prompt‑injection‑resistant (the **CaMeL** pattern). The planner LLM never sees raw tool output — results live guest‑side as `$1, $2, …` and the model only sees `{action, status, var}` stubs, so injected text in a tool result can never choose the next action. |
 
 Cross‑cutting features every program gets from the **SDK** (`sdk/`, the
@@ -64,9 +64,9 @@ Cross‑cutting features every program gets from the **SDK** (`sdk/`, the
 - **Capability‑based access** — a program only reaches the tools its manifest grants.
 - **Deterministic replay & crash recovery** — clock (`sdk::now`) and randomness
   (`sdk::random`) are syscalls, journaled on first run and replayed verbatim.
-- **Savepoints + transactional rollback** — `savepoint()` / `commit()`, plus
-  `compensate(&Call)` to register undo actions and `abort(reason, retry_seconds)` to
-  unwind them newest‑first and retry.
+- **Savepoints** — `savepoint()` / `commit()` bracket a section, and
+  `abort(reason, retry_seconds)` re-runs the open section from its `savepoint()`.
+  Nothing is undone: a section must be safe to re-run.
 - **Yield / resume** — pause on outside work (approval, timer) via the yield sentinel.
 - **Declarative interface manifests** — every program ships an `interface.json` the
   host reads without executing.
@@ -145,7 +145,7 @@ run/deploy step in *this* repo — a program only runs inside the processor.
 Cargo.toml           the workspace: members = sdk, programs/{agent,camel,echo}
 sdk/                 aurora-program-sdk — the syscall boundary every program uses
   src/lib.rs           dispatch, savepoints, input/output/log, capabilities,
-                       compensate/abort, now/random, and the ABI-v4 JSON
+                       abort, now/random, and the ABI-v4 JSON
                        envelope (ABI v4)
 programs/
   echo/              smallest program — no LLM, input → output

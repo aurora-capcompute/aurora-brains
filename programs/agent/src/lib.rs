@@ -220,7 +220,7 @@ fn run_agent() -> anyhow::Result<()> {
         // Each agentic turn — one LLM call plus the tool calls it requests —
         // is a savepoint: sys.begin here, sys.commit at the turn's end. If the
         // turn breaks mid-way (a malformed model reply, an unavailable
-        // capability, an aborted delegation), the savepoint is left open and a
+        // capability), the savepoint is left open and a
         // resumed run forks right after it, re-executing the WHOLE turn live —
         // including the LLM call, giving the model a fresh chance — instead of
         // deterministically replaying the broken completion forever.
