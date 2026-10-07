@@ -191,9 +191,8 @@ fn run_agent() -> anyhow::Result<()> {
     }
     // Whether a large read can be offloaded to scratch: core.scratch must be
     // granted and visible — a hidden grant the model can't search is no use for
-    // this, so it falls back to an inline summary instead. Scratch is
-    // process-local and ephemeral, so an offloaded page never touches durable or
-    // shared storage.
+    // this, so it falls back to an inline summary instead. Scratch is the
+    // session's own store: an offloaded page stays inside this session.
     let has_scratch = allowed.contains("core.scratch");
 
     for (i, msg) in inp.history.iter().enumerate() {
@@ -659,7 +658,7 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
 
 // maybe_offload_internet keeps one large read from flooding the window: when a
 // successful core.internet GET body (after HTML stripping) exceeds
-// OFFLOAD_THRESHOLD, the full body is stored in process-local scratch under a
+// OFFLOAD_THRESHOLD, the full body is stored in session scratch under a
 // content-addressed key and the observation's `body` is replaced with a
 // task-conditioned summary, a short verbatim excerpt, and that key — framed so
 // the model treats it as a pointer, not the content, and reaches for
@@ -726,7 +725,7 @@ fn maybe_offload_internet(
 fn offload_note(bytes: usize, stored_key: Option<&str>) -> String {
     match stored_key {
         Some(key) => format!(
-            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response — the full text is NOT in this conversation. It is stored in this process's scratch memory under the key \"{key}\". To read specific details, call core.scratch search on that key (a bounded regex grep over the stored value). Do NOT call get on it — get returns the whole large value and would re-flood this context."
+            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response — the full text is NOT in this conversation. It is stored in this session's scratch memory under the key \"{key}\". To read specific details, call core.scratch search on that key (a bounded regex grep over the stored value). Do NOT call get on it — get returns the whole large value and would re-flood this context."
         ),
         None => format!(
             "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response; the full text could not be stored and is NOT available. Work from this, or re-fetch a narrower page."
@@ -734,7 +733,7 @@ fn offload_note(bytes: usize, stored_key: Option<&str>) -> String {
     }
 }
 
-// store_blob writes a value into process-local scratch under key (best-effort).
+// store_blob writes a value into session scratch under key (best-effort).
 // A denied grant or an over-cap value comes back as an error or a failed status;
 // either way the caller falls back to an inline summary, so this never aborts
 // the run.
