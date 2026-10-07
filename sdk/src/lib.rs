@@ -258,13 +258,10 @@ pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
 
 /// abort abandons the open critical section instead of finishing with
 /// [`output`]. The journal forks at the section's begin and the whole section
-/// re-executes fresh; with no section open the process fails. The host ignores
-/// `retry_seconds`. The guest returns after calling abort.
-pub fn abort(reason: &str, retry_seconds: Option<u64>) -> anyhow::Result<()> {
-    let mut args = serde_json::json!({ "reason": reason });
-    if let Some(delay) = retry_seconds {
-        args["retry_seconds"] = delay.into();
-    }
+/// re-executes fresh; with no section open the process fails with `reason`.
+/// The guest returns after calling abort.
+pub fn abort(reason: &str) -> anyhow::Result<()> {
+    let args = serde_json::json!({ "reason": reason });
     dispatch(&Call {
         name: SYS_ABORT.into(),
         args: Some(args),

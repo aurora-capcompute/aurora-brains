@@ -38,7 +38,7 @@ A failed tool call is recoverable by default: use other sources, retry when appr
 Add \"hard\": true to a tool call only when its failure must abort the process so a later resume re-executes it (for example, a state-changing step the process cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish — the answer may reference $N and is substituted before delivery, or\n\
-{\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\",\"retry_seconds\":60}}]} to undo the registered effects and retry the task after the delay (omit retry_seconds to undo and stop); abort reasons are not substituted.\n\
+{\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\"}}]} to give up: the process stops as failed with that reason, and nothing it already did is undone; abort reasons are not substituted.\n\
 Never combine a terminal action with tool calls in the same actions array.";
 
 // MAX_STEPS is a hard cap on agentic turns; the last turn is forced to a final
@@ -224,11 +224,9 @@ fn run_camel() -> anyhow::Result<()> {
 
         if !has_tool {
             if let Some(idx) = first_abort_idx {
-                // The model gave up and asked to abandon the task: the host
-                // forks the journal at the open begin and retries after the
-                // given delay, or stops. Commit the turn first so no section is
-                // left open — a model abort re-runs the whole task, not just
-                // this turn.
+                // The model gave up. Commit the turn first so no section is left
+                // open: with nothing to re-run, the host stops the process as
+                // failed with the model's reason.
                 // The reason is model-authored control metadata; it is passed
                 // through unsubstituted so quarantined data never rides out on
                 // the abort channel.
@@ -238,12 +236,8 @@ fn run_camel() -> anyhow::Result<()> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let retry = envelopes[idx]
-                    .content
-                    .get("retry_seconds")
-                    .and_then(|v| v.as_u64());
                 turn.commit()?;
-                return sdk::abort(&reason, retry);
+                return sdk::abort(&reason);
             }
             if let Some(idx) = first_final_idx {
                 // Resolve $N references before committing, so a bad final

@@ -17,7 +17,7 @@ Each observation has status \"result\" with content or status \"failed\" with an
 Add \"hard\": true to a tool call only when its failure must abort the process so a later resume re-executes it (for example, a state-changing step the process cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish, or\n\
-{\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\",\"retry_seconds\":60}}]} to undo the registered effects and retry the task after the delay (omit retry_seconds to undo and stop).\n\
+{\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\"}}]} to give up: the process stops as failed with that reason, and nothing it already did is undone.\n\
 Never combine a terminal action with tool calls in the same actions array.";
 
 // Context-management bounds. The transcript's serialized byte length is a cheap
@@ -267,23 +267,11 @@ fn run_agent() -> anyhow::Result<()> {
 
         if !has_tool {
             if let Some(idx) = first_abort_idx {
-                // The model gave up and asked to abandon the task: the host
-                // forks the journal at the open begin and retries after the
-                // given delay, or stops. Commit the turn first so no section is
-                // left open — a model abort re-runs the whole task, not just
-                // this turn.
-                let reason = envelopes[idx]
-                    .content
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let retry = envelopes[idx]
-                    .content
-                    .get("retry_seconds")
-                    .and_then(|v| v.as_u64());
+                // The model gave up. Commit the turn first so no section is left
+                // open: with nothing to re-run, the host stops the process as
+                // failed with the model's reason.
                 turn.commit()?;
-                return sdk::abort(&reason, retry);
+                return sdk::abort(&abort_reason(&envelopes[idx]));
             }
             if let Some(idx) = first_final_idx {
                 turn.commit()?;
@@ -311,7 +299,7 @@ fn run_agent() -> anyhow::Result<()> {
             if envelope.content.is_null() {
                 anyhow::bail!("capability action {} missing content", i);
             }
-            emit_progress(&envelope.action, &envelope.content);
+            emit_progress(&envelope.action);
             let tool_call = Call {
                 name: envelope.action.clone(),
                 args: Some(envelope.content.clone()),
@@ -505,8 +493,7 @@ fn wrap_up(chat: &str) -> anyhow::Result<()> {
             return output_final(&envelopes[idx]);
         }
         if let Some(idx) = envelopes.iter().position(|e| e.action == "abort") {
-            let (reason, retry) = abort_fields(&envelopes[idx]);
-            return sdk::abort(&reason, retry);
+            return sdk::abort(&abort_reason(&envelopes[idx]));
         }
     }
     sdk::output(&FinishArgs {
@@ -514,19 +501,14 @@ fn wrap_up(chat: &str) -> anyhow::Result<()> {
     })
 }
 
-// abort_fields reads the reason and optional retry delay from an abort envelope.
-fn abort_fields(envelope: &ModelEnvelope) -> (String, Option<u64>) {
-    let reason = envelope
+// abort_reason reads the reason from an abort envelope.
+fn abort_reason(envelope: &ModelEnvelope) -> String {
+    envelope
         .content
         .get("reason")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .to_string();
-    let retry = envelope
-        .content
-        .get("retry_seconds")
-        .and_then(|v| v.as_u64());
-    (reason, retry)
+        .to_string()
 }
 
 // salvage_answer extracts a usable answer from a reply that would not parse as a
@@ -1089,51 +1071,8 @@ fn llm_chat(messages: &[Message]) -> anyhow::Result<String> {
     Ok(chat.choices[0].message.content.clone())
 }
 
-fn emit_progress(action: &str, content: &Value) {
-    sdk::log(&progress_summary(action, content));
-}
-
-fn progress_summary(action: &str, content: &Value) -> String {
-    let fields = match content.as_object() {
-        Some(f) => f,
-        None => return format!("⚙ {}", action),
-    };
-    if action.starts_with("call.") {
-        if let Some(s) = fields.get("message").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                let truncated = if s.len() > 80 {
-                    // Char-boundary clamp: &s[..80] would panic on multi-byte
-                    // UTF-8 in a model-authored message.
-                    format!("{}…", truncate_bytes(s, 80))
-                } else {
-                    s.to_string()
-                };
-                return format!("🔀 {}: {}", action, truncated);
-            }
-        }
-        return format!("🔀 {}", action);
-    }
-    if action.starts_with("k8s.") || action.starts_with("helm.") {
-        let mut parts: Vec<&str> = Vec::new();
-        for key in &[
-            "kind",
-            "namespace",
-            "name",
-            "release",
-            "chart",
-            "api_version",
-        ] {
-            if let Some(s) = fields.get(*key).and_then(|v| v.as_str()) {
-                if !s.is_empty() {
-                    parts.push(s);
-                }
-            }
-        }
-        if !parts.is_empty() {
-            return format!("⚙ {} {}", action, parts.join("/"));
-        }
-    }
-    format!("⚙ {}", action)
+fn emit_progress(action: &str) {
+    sdk::log(&format!("⚙ {}", action));
 }
 
 #[cfg(test)]

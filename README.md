@@ -65,7 +65,8 @@ Cross‑cutting features every program gets from the **SDK** (`sdk/`, the
 - **Deterministic replay & crash recovery** — clock (`sdk::now`) and randomness
   (`sdk::random`) are syscalls, journaled on first run and replayed verbatim.
 - **Savepoints** — `savepoint()` / `commit()` bracket a section, and
-  `abort(reason, retry_seconds)` re-runs the open section from its `savepoint()`.
+  `abort(reason)` re-runs the open section from its `savepoint()`; with no section
+  open, the process fails with `reason`.
   Nothing is undone: a section must be safe to re-run.
 - **Yield / resume** — pause on outside work (approval, timer) via the yield sentinel.
 - **Declarative interface manifests** — every program ships an `interface.json` the
