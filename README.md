@@ -146,8 +146,9 @@ run/deploy step in *this* repo — a program only runs inside the processor.
 Cargo.toml           the workspace: members = sdk, programs/{agent,camel,echo}
 sdk/                 aurora-program-sdk — the syscall boundary every program uses
   src/lib.rs           dispatch, savepoints, input/output/log, capabilities,
-                       abort, now/random, and the ABI-v4 JSON
-                       envelope (ABI v4)
+                       abort, now/random, and the ABI-v4 JSON envelope
+  src/llm.rs           the chat call and model-reply decoding the conversational
+                       programs share
 programs/
   echo/              smallest program — no LLM, input → output
   agent/             general-purpose tool-calling LLM loop (adds lol_html for HTML→text)

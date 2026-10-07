@@ -6,13 +6,16 @@
 //!
 //! On top of that it owns the typed plumbing a program would otherwise
 //! re-implement by hand: [`input`]/[`output`] for the process's payloads, [`log`]
-//! for progress, and the decoded [`Capability`] menu the host grants. What is
-//! left for the program is cognition.
+//! for progress, the decoded [`Capability`] menu the host grants, and [`llm`] —
+//! the chat call and the model-reply decoding conversational programs share.
+//! What is left for the program is cognition.
 //!
 //! A program is one cdylib crate under `programs/<name>/` that depends on this
 //! SDK and exports its entrypoint with `#[plugin_fn]`. It ships with an
 //! `interface.json` manifest — its description and input/output JSON Schemas —
 //! that the host loads alongside the wasm.
+
+pub mod llm;
 
 use extism_pdk::Memory;
 use serde::de::DeserializeOwned;

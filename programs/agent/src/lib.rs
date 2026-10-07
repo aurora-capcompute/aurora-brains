@@ -1,4 +1,8 @@
 use aurora_program_sdk as sdk;
+use aurora_program_sdk::llm::{
+    self, decode_model_envelopes, extract_json_region, looks_like_tool_batch, truncate_bytes,
+    Message, ModelEnvelope,
+};
 use aurora_program_sdk::{Call, Capability};
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
@@ -38,12 +42,6 @@ const COMPACT_THRESHOLD: usize = 512 * 1024;
 const HARD_CEILING: usize = 768 * 1024;
 const KEEP_RECENT: usize = 6;
 
-// MAX_COMPLETION_TOKENS caps each model reply so a long final answer is not
-// truncated by a smaller provider default (a truncated reply loses its closing
-// JSON and only salvages as partial text). Tool-call turns are short JSON and
-// stop well under it; only a verbose final answer approaches it.
-const MAX_COMPLETION_TOKENS: u32 = 4096;
-
 // A large tool read (a fetched page bigger than this, after HTML stripping) is
 // offloaded to memory instead of inlined: the full body is stored under a
 // content-addressed key and the model is handed a summary + a short verbatim
@@ -80,48 +78,6 @@ struct Input {
     /// know earlier attempts were rolled back and back off accordingly.
     #[serde(default)]
     attempt: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Message {
-    role: String,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct LlmRequest<'a> {
-    // The ADT discriminator selecting the chat operation of the core.openaiApi
-    // family; the host routes on it and strips it from the provider request.
-    operation: &'static str,
-    messages: &'a [Message],
-    // Cap the reply so a long final answer is not truncated by the provider's
-    // default; forwarded verbatim to the provider by the driver.
-    max_completion_tokens: u32,
-}
-
-#[derive(Deserialize)]
-struct LlmResponse {
-    choices: Vec<LlmChoice>,
-}
-
-#[derive(Deserialize)]
-struct LlmChoice {
-    message: LlmChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct LlmChoiceMessage {
-    content: String,
-}
-
-#[derive(Debug)]
-struct ModelEnvelope {
-    action: String,
-    content: Value,
-    // `hard` marks a call whose failure must abort the process (with its savepoint
-    // left open) so a later resume re-executes it, instead of being reported back
-    // as a recoverable observation. Default is the soft path.
-    hard: bool,
 }
 
 #[derive(Deserialize)]
@@ -369,7 +325,7 @@ fn run_agent() -> anyhow::Result<()> {
 // (e.g. an approval) is not a size error and propagates unchanged.
 fn chat_within_budget(messages: &mut [Message]) -> anyhow::Result<String> {
     loop {
-        match llm_chat(messages) {
+        match llm::chat(messages) {
             Ok(chat) => return Ok(chat),
             Err(e) => {
                 if !is_size_error(&e.to_string()) || !shrink_messages(messages) {
@@ -464,7 +420,7 @@ fn summarize(excerpt: &str) -> anyhow::Result<String> {
             content: format!("Compress these earlier steps:\n\n{}", excerpt),
         },
     ];
-    llm_chat(&msgs)
+    llm::chat(&msgs)
 }
 
 // finalize forces the run to a close: it commits the current turn after asking
@@ -539,17 +495,6 @@ fn salvage_answer(chat: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-// looks_like_tool_batch reports whether a reply's JSON region still carries an
-// "action"/"actions" key — the shape of a tool-call batch rather than a prose
-// reply. A botched or truncated batch is kept out of the salvage path so its raw
-// {"actions":...} protocol text is never published as the answer; a prose reply
-// (no such key) or a truncated final (recovered earlier by its "answer") is not
-// affected.
-fn looks_like_tool_batch(chat: &str) -> bool {
-    let region = extract_json_region(chat);
-    region.contains("\"action\"") || region.contains("\"actions\"")
 }
 
 // recover_answer_field pulls the text of an "answer" string field out of a reply
@@ -778,19 +723,6 @@ fn head_excerpt(s: &str, max: usize) -> String {
     }
 }
 
-// truncate_bytes clamps s to at most max bytes, backing up to the nearest char
-// boundary so the result stays valid UTF-8.
-fn truncate_bytes(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 // html_to_text extracts readable text from HTML with lol_html (Cloudflare's
 // streaming rewriter): it keeps only ordinary `Data` text — so <script>/<style>/
 // <title> content, which the parser tags as ScriptData/RawText, is dropped — and
@@ -911,127 +843,6 @@ fn build_system_prompt(capabilities: &[Capability]) -> anyhow::Result<String> {
     Ok(prompt)
 }
 
-fn decode_model_envelopes(content: &str) -> anyhow::Result<Vec<ModelEnvelope>> {
-    decode_model_envelope_stream(content, 0)
-}
-
-fn decode_model_envelope_stream(content: &str, depth: u32) -> anyhow::Result<Vec<ModelEnvelope>> {
-    if depth > 1 {
-        anyhow::bail!("nested encoded model JSON is not supported");
-    }
-    // Reasoning models (e.g. deepseek-reasoner) often wrap the JSON batch in
-    // prose or a markdown code fence — "Let me look it up.\n\n{...}". Narrow to
-    // the JSON region before parsing, and tolerate trailing commentary once a
-    // valid batch has been decoded, rather than requiring the whole reply to be
-    // bare JSON.
-    let json_part = extract_json_region(content);
-    let mut envelopes = Vec::new();
-    let stream = serde_json::Deserializer::from_str(json_part).into_iter::<Value>();
-    for result in stream {
-        let value = match result {
-            Ok(value) => value,
-            // A parse error after we already have envelopes means trailing prose
-            // after the batch; stop. Before any envelope it's a genuine failure.
-            Err(_) if !envelopes.is_empty() => break,
-            Err(e) => return Err(e.into()),
-        };
-        match &value {
-            Value::Array(arr) => {
-                for item in arr {
-                    let decoded = decode_model_envelope_object(item.clone())?;
-                    envelopes.extend(decoded);
-                }
-            }
-            Value::Object(_) => {
-                let decoded = decode_model_envelope_object(value)?;
-                envelopes.extend(decoded);
-            }
-            Value::String(s) => {
-                let nested = decode_model_envelope_stream(s, depth + 1)?;
-                envelopes.extend(nested);
-            }
-            _ if !envelopes.is_empty() => break,
-            _ => anyhow::bail!("expected action object or array"),
-        }
-    }
-    if envelopes.is_empty() {
-        anyhow::bail!("model action batch is empty");
-    }
-    Ok(envelopes)
-}
-
-// extract_json_region trims a model reply down to the JSON batch, dropping a
-// natural-language preamble and/or a surrounding markdown code fence. It returns
-// the slice starting at the first JSON value; trailing text after the value is
-// handled by the caller's parse loop.
-fn extract_json_region(content: &str) -> &str {
-    let mut s = content.trim();
-    if let Some(rest) = s.strip_prefix("```") {
-        // Drop an optional language tag on the fence's first line (```json).
-        let body = rest.find('\n').map(|i| &rest[i + 1..]).unwrap_or(rest);
-        // Cut at the closing fence when present.
-        s = body.find("```").map(|i| &body[..i]).unwrap_or(body).trim();
-    }
-    match s.find(['{', '[']) {
-        Some(i) => &s[i..],
-        None => s,
-    }
-}
-
-fn decode_model_envelope_object(value: Value) -> anyhow::Result<Vec<ModelEnvelope>> {
-    // Skip diagnostic objects (non-empty "error" field).
-    if let Some(err_str) = value.get("error").and_then(|v| v.as_str()) {
-        if !err_str.is_empty() {
-            return Ok(vec![]);
-        }
-    }
-
-    // Unwrap a batch wrapper that has an "actions" array.
-    if let Some(actions_val) = value.get("actions") {
-        let items: Vec<Value> = serde_json::from_value(actions_val.clone())
-            .map_err(|e| anyhow::anyhow!("actions must be an array: {}", e))?;
-        if items.is_empty() {
-            anyhow::bail!("model action batch is empty");
-        }
-        let mut envelopes = Vec::new();
-        for item in items {
-            let decoded = decode_model_envelope_object(item)?;
-            envelopes.extend(decoded);
-        }
-        return Ok(envelopes);
-    }
-
-    // Single envelope.
-    let action = value
-        .get("action")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "action is required in model object: {}",
-                abbreviated_json(&value, 300)
-            )
-        })?;
-    let content = value.get("content").cloned().unwrap_or(Value::Null);
-    let hard = value.get("hard").and_then(|v| v.as_bool()).unwrap_or(false);
-    Ok(vec![ModelEnvelope {
-        action: action.to_string(),
-        content,
-        hard,
-    }])
-}
-
-fn abbreviated_json(value: &Value, limit: usize) -> String {
-    let s = serde_json::to_string(value).unwrap_or_default();
-    if s.len() <= limit {
-        s
-    } else {
-        // Clamp on a char boundary: a fixed byte slice would panic on multi-byte
-        // UTF-8 in a model-authored value, and this runs while building an error.
-        format!("{}[...]", truncate_bytes(&s, limit))
-    }
-}
-
 fn output_final(envelope: &ModelEnvelope) -> anyhow::Result<()> {
     if envelope.content.is_null() {
         anyhow::bail!("invalid final action: content is required");
@@ -1046,31 +857,6 @@ fn output_final(envelope: &ModelEnvelope) -> anyhow::Result<()> {
     })
 }
 
-fn llm_chat(messages: &[Message]) -> anyhow::Result<String> {
-    let req = LlmRequest {
-        operation: "chat",
-        messages,
-        max_completion_tokens: MAX_COMPLETION_TOKENS,
-    };
-    let args = serde_json::to_value(&req)?;
-    let response = sdk::dispatch(&Call {
-        name: "core.openaiApi".into(),
-        args: Some(args),
-    })?;
-    if response.status != sdk::STATUS_RESULT {
-        anyhow::bail!("host failure: {}", response.message);
-    }
-    let result = response
-        .result
-        .ok_or_else(|| anyhow::anyhow!("LLM returned empty result"))?;
-    let chat: LlmResponse = serde_json::from_value(result)
-        .map_err(|e| anyhow::anyhow!("decode llm response: {}", e))?;
-    if chat.choices.is_empty() {
-        anyhow::bail!("provider returned no choices");
-    }
-    Ok(chat.choices[0].message.content.clone())
-}
-
 fn emit_progress(action: &str) {
     sdk::log(&format!("⚙ {}", action));
 }
@@ -1078,16 +864,6 @@ fn emit_progress(action: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // A model that answers directly in prose — no action envelope — must not
-    // parse as an envelope; wrap_up then salvages it (see below) rather than
-    // failing the run, which is the bug this guards against.
-    #[test]
-    fn prose_reply_is_not_a_valid_envelope() {
-        let prose = "\n\nWarp has real trade-offs. **Strengths:** fast, modern. \
-                     **Weaknesses:** closed-source. Verdict: worth trying.";
-        assert!(decode_model_envelopes(prose).is_err());
-    }
 
     // Salvage returns the model's prose verbatim (trimmed) as the answer.
     #[test]
@@ -1147,37 +923,6 @@ mod tests {
         assert!(!got.contains("\"action\""), "protocol leaked: {got}");
     }
 
-    // The chat request carries a completion-token cap so a long final answer is
-    // not truncated by the provider default.
-    #[test]
-    fn llm_request_caps_completion_tokens() {
-        let messages = vec![Message {
-            role: "user".into(),
-            content: "hi".into(),
-        }];
-        let value = serde_json::to_value(LlmRequest {
-            operation: "chat",
-            messages: &messages,
-            max_completion_tokens: MAX_COMPLETION_TOKENS,
-        })
-        .unwrap();
-        assert_eq!(value["operation"], "chat");
-        assert_eq!(
-            value["max_completion_tokens"].as_u64(),
-            Some(MAX_COMPLETION_TOKENS as u64)
-        );
-    }
-
-    // A proper final envelope still decodes normally — salvage is a fallback,
-    // not the primary path.
-    #[test]
-    fn well_formed_final_still_decodes() {
-        let reply = r#"{"actions":[{"action":"final","content":{"answer":"hi"}}]}"#;
-        let envelopes = decode_model_envelopes(reply).unwrap();
-        assert_eq!(envelopes.len(), 1);
-        assert_eq!(envelopes[0].action, "final");
-    }
-
     // -- large-read offload helpers --
 
     // The content hash is stable for a given input (so a resume's replay
@@ -1187,15 +932,6 @@ mod tests {
         assert_eq!(content_hash("the same page"), content_hash("the same page"));
         assert_ne!(content_hash("page a"), content_hash("page b"));
         assert_eq!(content_hash("x").len(), 16);
-    }
-
-    // truncate_bytes clamps to a byte budget without splitting a multi-byte char.
-    #[test]
-    fn truncate_bytes_respects_char_boundaries() {
-        assert_eq!(truncate_bytes("hello", 100), "hello");
-        assert_eq!(truncate_bytes("hello", 3), "hel");
-        // "é" is two bytes; a 3-byte clamp of "aé" must drop it, not split it.
-        assert_eq!(truncate_bytes("aé", 2), "a");
     }
 
     // The excerpt is verbatim when it fits and carries a cut marker when it
