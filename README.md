@@ -1,84 +1,57 @@
 # aurora-brains
 
-**The "brains" of Aurora agents — the actual decision‑making code.** This is a Rust
-workspace of small programs that each compile to a WebAssembly (`wasm32-wasip1`)
-module and run as a sandboxed agent inside the capcompute processor.
+A Rust workspace of Aurora **programs**. Each program compiles to a
+WebAssembly module (`wasm32-wasip1`) and runs as a process inside the
+[capcompute](https://github.com/aurora-capcompute/capcompute) processor. (The
+repo keeps its old name. Its contents are programs, not blockchain code.)
 
-> The repo is still named `aurora-brains`; its contents are Aurora **programs**
-> (a rename to `aurora-programs` is pending).
+A program is one agent's logic: its LLM loop and its decisions. It has no
+ambient authority. It cannot read the real clock, get entropy, open a
+connection or call an LLM. It asks the host through **syscalls**, and the host
+checks, journals and replays each one. So a program can do only what its
+manifest grants, and a crash does not lose its progress.
 
-> **Not blockchain.** Despite the `programs/` + `sdk/` layout, this has nothing to
-> do with Solana/Anchor or any chain. "Programs" here are Wasm agent modules.
+To run a program, put its `<name>.wasm` and `<name>.json` into
+[aurora-dist](https://github.com/aurora-capcompute/aurora-dist)'s programs
+directory and start the server. A `spawn` from
+[aurora-cli](https://github.com/aurora-capcompute/aurora-cli) or the Slack
+connector runs it.
 
----
-
-## What is this, in plain words?
-
-A **program** is the cognition of one agent — its LLM loop and decision logic. It
-runs as a deterministic Wasm guest inside the
-[capcompute](https://github.com/aurora-capcompute/capcompute) processor and holds
-**zero ambient authority**: it can't read the clock, generate randomness, make a
-network call, or even call an LLM on its own. It can only *ask* the host to do those
-things through **journaled syscalls** — each one validated, permission‑checked,
-recorded, replayable, and reversible by the host. A running program is a **process**.
-
-Why bother? Because it lets you run LLM‑driven agent logic **safely, deterministically,
-and auditably**, with crash‑recovery built in — the agent literally cannot
-do anything the host didn't grant.
-
-## Where this fits in the Aurora system
-
-```
-        you (a human)
-              │
-   aurora-cli / aurora-slack-connector      ← clients you talk to
-              │  HTTP /v1
-         aurora-dist                         ← the server (one binary you run)
-              │  assembled from…
-   ┌──────────┴──────────┐
- aurora-capcompute    aurora-dispatchers     ← orchestration runtime + capability drivers
-   └──────────┬──────────┘
-              │  both built on
-         capcompute                          ← the processor (the foundation)
-
-   aurora-brains  ◀── YOU ARE HERE (the Wasm agent "programs" that run inside)
-```
-
-You build a program here into a `<name>.wasm` + `<name>.json` pair, drop it into
-[aurora-dist](https://github.com/aurora-capcompute/aurora-dist)'s programs directory,
-and the running server loads it. When you `spawn` a process (via
-[aurora-cli](https://github.com/aurora-capcompute/aurora-cli) or the Slack bot), *this*
-is the code that runs.
-
-## The programs (features)
+## Programs
 
 | Program | What it is |
 | --- | --- |
-| **`echo`** | The smallest possible program — no LLM, just input → output (returns `"pong"` when empty). The minimal example to copy. |
-| **`agent`** | The general‑purpose agent: a tool‑calling LLM loop over whatever capabilities its manifest grants. Handles multi‑action turns, per‑turn savepoints, stripping fetched web pages to text, transcript compaction, and offloading big reads to scratch memory. |
+| `agent` | The general agent: a tool-calling LLM loop over whatever its manifest grants. It handles several actions per turn, a savepoint per turn, web pages reduced to text, transcript compaction, and large reads offloaded to `core.scratch`. |
+| `echo` | The smallest program, with no LLM: it returns its input, or `"pong"` when the input is empty. Copy it to start a new program. |
 
-Cross‑cutting features every program gets from the **SDK** (`sdk/`, the
-`aurora-program-sdk` crate):
+## The SDK
 
-- **Capability‑based access** — a program only reaches the tools its manifest grants.
-- **Deterministic replay & crash recovery** — clock (`sdk::now`) and randomness
-  (`sdk::random`) are syscalls, journaled on first run and replayed verbatim.
-- **Savepoints** — `savepoint()` / `commit()` bracket a section, and
-  `abort(reason)` re-runs the open section from its `savepoint()`; with no section
-  open, the process fails with `reason`.
-  Nothing is undone: a section must be safe to re-run.
-- **Yield / resume** — pause on outside work (approval, timer) via the yield sentinel.
-- **Declarative interface manifests** — every program ships an `interface.json` the
-  host reads without executing.
-- **Cross‑language ABI pinning** — the envelope is JSON (ABI v4), so guest and
-  host serialize the same field set with their standard libraries; agreement is
-  proven end‑to‑end by `aurora-capcompute`'s suite, which builds these programs
-  and drives them through the real Go host.
+`sdk/` (the `aurora-program-sdk` crate) is the syscall boundary that every
+program uses:
 
-## Every program ships a manifest
+- `dispatch`: call a granted capability. A failure comes back as a response
+  that the program can act on.
+- `dispatch_hard`: the same call inside its own savepoint. A failure fails the
+  process, and a retry runs the call again.
+- `input`, `output`, `log`: read the input, record the answer, report progress.
+- `savepoint()` / `commit()`: bracket a section. `abort(reason)` runs the open
+  section again from its `savepoint()`. With no open section, the process
+  fails with `reason`. Nothing is undone, so a section must be safe to run
+  again.
+- `now`, `random`: real time and entropy as journaled syscalls, so replay
+  sees the same values.
+- `yielded`: detects a yield (an approval or a timer), which the program
+  passes up so the process can pause.
+- `llm`: the chat call and model-reply decoding.
 
-Beside its source, each program has an `interface.json` — a one‑line `description`
-plus JSON Schemas for the process's `input` and its answer `output`:
+The envelope is JSON (ABI v4). Guest and host encode the same fields with their
+standard libraries. The aurora-capcompute and aurora-dist tests build `agent`
+and run it through the real Go host.
+
+## The interface file
+
+Each program has an `interface.json`: a one-line `description` and JSON Schemas
+for its `input` and its answer (`output`).
 
 ```json
 {
@@ -88,84 +61,43 @@ plus JSON Schemas for the process's `input` and its answer `output`:
 }
 ```
 
-Conversational programs declare `{"type":"string"}`; structured ones declare object
-schemas. The build copies the manifest next to the Wasm (`<name>.wasm` +
-`<name>.json`) — that pair is what a programs directory loads. The host reads it
-declaratively, shows it to callers (so a parent agent or a human knows what to pass),
-and validates every input and answer against the schemas.
+A conversational program declares `{"type":"string"}`. A structured one declares
+an object schema. The build copies the file beside the Wasm. The host reads it
+without running the program, shows it at `GET /v1/programs`, and checks every
+input and answer against it.
 
-## Quick start (5 minutes)
+## Build
 
-**Prerequisites:** Rust (stable) with the `wasm32-wasip1` target:
+Requirement: Rust (stable) with the `wasm32-wasip1` target.
 
 ```sh
 rustup target add wasm32-wasip1
-```
-
-Clone and build the smallest program:
-
-```sh
-git clone https://github.com/aurora-capcompute/aurora-brains
-cd aurora-brains
-
-sh programs/echo/build.sh
-# → programs/echo/dist/{echo.wasm, echo.json}
-```
-
-Build any program directly, or build + test the whole workspace:
-
-```sh
-cargo build --release --target wasm32-wasip1 -p agent   # or -p echo
-cargo build --release --target wasm32-wasip1 --workspace
+sh programs/echo/build.sh                                 # programs/echo/dist/{echo.wasm,echo.json}
+cargo build --release --target wasm32-wasip1 -p agent    # one program
+cargo build --release --target wasm32-wasip1 --workspace # all
 cargo test --workspace
 ```
 
-**To see a program actually run**, hand the built `.wasm` + `.json` pair to a host:
-drop them into [aurora-dist](https://github.com/aurora-capcompute/aurora-dist)'s
-`-programs` directory, run the server, and `spawn` a process with
-[aurora-cli](https://github.com/aurora-capcompute/aurora-cli). There is no
-run/deploy step in *this* repo — a program only runs inside the processor.
+## Write a new program
 
-## Example: writing a new program
+1. Copy `programs/echo` to `programs/<name>` and change the package name.
+2. Add `"programs/<name>"` to `members` in the root `Cargo.toml`.
+3. In `src/lib.rs`, read the input with `sdk::input`, do the work, and record
+   the answer with `sdk::output`. Export the entrypoint with `#[plugin_fn]`.
+   Return `{"status":"completed"}`, or `{"status":"yielded"}` when a syscall
+   yielded.
+4. Write `interface.json`.
+5. Keep the program deterministic: no clock, randomness or I/O except through
+   the SDK.
 
-1. `mkdir -p programs/<name>/src` and copy `programs/echo/Cargo.toml`, changing the
-   package name and description.
-2. Add `"programs/<name>"` to the workspace `members` in the root `Cargo.toml`.
-3. Write `src/lib.rs`: read input with `sdk::input`, do the cognition, report the
-   result with `sdk::output` (and `sdk::log` for progress), and export the
-   entrypoint with `#[plugin_fn]`. Return `{"status":"completed"}`, or bubble the
-   yield sentinel and return `{"status":"yielded"}`.
-4. Write `interface.json` (see `programs/echo/interface.json` for the minimal shape).
-5. Keep it **deterministic** — no clocks, randomness, or I/O outside the SDK's
-   syscalls. The processor pins the ambient sources and the journal replays the rest.
-
-## Project layout
+## Layout
 
 ```
-Cargo.toml           the workspace: members = sdk, programs/{agent,echo}
-sdk/                 aurora-program-sdk — the syscall boundary every program uses
-  src/lib.rs           dispatch, savepoints, input/output/log, capabilities,
-                       abort, now/random, and the ABI-v4 JSON envelope
-  src/llm.rs           the chat call and model-reply decoding
-programs/
-  echo/              smallest program — no LLM, input → output
-  agent/             general-purpose tool-calling LLM loop (adds lol_html for HTML→text)
+Cargo.toml        the workspace: sdk, programs/agent, programs/echo
+sdk/src/lib.rs    dispatch, savepoints, input/output/log, abort, now/random, the envelope
+sdk/src/llm.rs    the chat call and model-reply decoding
+programs/<name>/  the crate (src/), interface.json, build.sh
 ```
 
-Each `programs/<name>/` holds the crate (`src/`), its `interface.json`, and a
-`build.sh`. A program crate contains only cognition — the safety boundary lives in
-the SDK.
-
-## Dependencies
-
-`extism-pdk` (the Wasm guest runtime), `serde`/`serde_json`, `anyhow`, the local
-`aurora-program-sdk`, and — only in `agent` — `lol_html` (to strip fetched pages to
-text). Nothing else.
-
-## Related repos
-
-- [capcompute](https://github.com/aurora-capcompute/capcompute) — the processor these programs run inside
-- [aurora-capcompute](https://github.com/aurora-capcompute/aurora-capcompute) — the runtime that manages them as processes
-- [aurora-dispatchers](https://github.com/aurora-capcompute/aurora-dispatchers) — the drivers behind the capabilities they call
-- [aurora-dist](https://github.com/aurora-capcompute/aurora-dist) — the server you drop the built programs into
-- [aurora-cli](https://github.com/aurora-capcompute/aurora-cli) — the terminal you spawn processes from
+Dependencies: `extism-pdk`, `serde`, `serde_json`, `anyhow`, and `lol_html` (only
+in `agent`, to reduce HTML to text).
