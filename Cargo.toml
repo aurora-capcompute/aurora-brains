@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["sdk", "programs/agent", "programs/camel", "programs/echo"]
+members = ["sdk", "programs/agent", "programs/echo"]
 
 # Every program is one crate under programs/<name>/, compiled to wasm32-wasip1
 # as a cdylib. New program: copy programs/echo/Cargo.toml, depend on the sdk,

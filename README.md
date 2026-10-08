@@ -56,7 +56,6 @@ is the code that runs.
 | --- | --- |
 | **`echo`** | The smallest possible program — no LLM, just input → output (returns `"pong"` when empty). The minimal example to copy. |
 | **`agent`** | The general‑purpose agent: a tool‑calling LLM loop over whatever capabilities its manifest grants. Handles multi‑action turns, per‑turn savepoints, stripping fetched web pages to text, transcript compaction, and offloading big reads to scratch memory. |
-| **`camel`** | Same protocol as `agent`, but prompt‑injection‑resistant (the **CaMeL** pattern). The planner LLM never sees raw tool output — results live guest‑side as `$1, $2, …` and the model only sees `{action, status, var}` stubs, so injected text in a tool result can never choose the next action. |
 
 Cross‑cutting features every program gets from the **SDK** (`sdk/`, the
 `aurora-program-sdk` crate):
@@ -116,7 +115,7 @@ sh programs/echo/build.sh
 Build any program directly, or build + test the whole workspace:
 
 ```sh
-cargo build --release --target wasm32-wasip1 -p agent   # or -p camel, -p echo
+cargo build --release --target wasm32-wasip1 -p agent   # or -p echo
 cargo build --release --target wasm32-wasip1 --workspace
 cargo test --workspace
 ```
@@ -143,16 +142,14 @@ run/deploy step in *this* repo — a program only runs inside the processor.
 ## Project layout
 
 ```
-Cargo.toml           the workspace: members = sdk, programs/{agent,camel,echo}
+Cargo.toml           the workspace: members = sdk, programs/{agent,echo}
 sdk/                 aurora-program-sdk — the syscall boundary every program uses
   src/lib.rs           dispatch, savepoints, input/output/log, capabilities,
                        abort, now/random, and the ABI-v4 JSON envelope
-  src/llm.rs           the chat call and model-reply decoding the conversational
-                       programs share
+  src/llm.rs           the chat call and model-reply decoding
 programs/
   echo/              smallest program — no LLM, input → output
   agent/             general-purpose tool-calling LLM loop (adds lol_html for HTML→text)
-  camel/             plan/execute, prompt-injection-resistant (quarantine.rs holds the $N vars)
 ```
 
 Each `programs/<name>/` holds the crate (`src/`), its `interface.json`, and a
