@@ -7,7 +7,16 @@ repo keeps its old name. Its contents are the agent, not blockchain code.)
 
 The agent is a tool-calling LLM loop over whatever its manifest grants. It
 handles several actions per turn, a savepoint per turn, web pages reduced to
-text, transcript compaction, and large reads offloaded to `core.scratch`.
+text, and transcript compaction.
+
+When the manifest grants `core.scratch` with `store`, the agent saves every
+successful tool result in the session's scratch memory, under a key made from
+the result's content (`io/<hash>`). A saved result never changes. The model
+gets the key with each result. A large result shows only its head, and the
+model reads on with `core.scratch search` on the key. With `get` also granted,
+the model can call the `summarize` action. The agent then summarizes the saved
+result in a separate LLM chat, and only the summary enters the model's
+conversation.
 
 It has no ambient authority. It cannot read the real clock, get entropy, open a
 connection or call an LLM. It asks the host through **syscalls**, and the host

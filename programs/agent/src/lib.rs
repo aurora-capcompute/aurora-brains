@@ -8,9 +8,7 @@ use extism_pdk::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm guest.\n\
@@ -42,20 +40,18 @@ const COMPACT_THRESHOLD: usize = 512 * 1024;
 const HARD_CEILING: usize = 768 * 1024;
 const KEEP_RECENT: usize = 6;
 
-// A large tool read (a fetched page bigger than this, after HTML stripping) is
-// offloaded to memory instead of inlined: the full body is stored under a
-// content-addressed key and the model is handed a summary + a short verbatim
-// excerpt + that key, so one big page can't flood — or, via get, repeatedly
-// re-flood — the window. The summary's input is capped at HARD_CEILING (the
-// model's per-turn budget); the full body still lives in the store, searchable
-// whole. Below the threshold a read inlines as before — a round-trip to the
-// store would be pure overhead.
-const OFFLOAD_THRESHOLD: usize = 48 * 1024;
-const FETCH_EXCERPT_BYTES: usize = 2 * 1024;
+// Every successful tool result is saved in session scratch with core.scratch
+// store, under an io/ key made from its content. A result up to INLINE_LIMIT
+// also goes into the transcript whole. A larger one goes in as its key, its size
+// and a head excerpt of EXCERPT_BYTES, so one big read cannot flood the window.
+// The model reads on with core.scratch search, or with the summarize action,
+// which summarizes a saved value in a separate chat of at most HARD_CEILING.
+const INLINE_LIMIT: usize = 48 * 1024;
+const EXCERPT_BYTES: usize = 2 * 1024;
 
 const SUMMARY_PROMPT: &str = "You compress an AI agent's earlier working log. Preserve every fact, URL, identifier, number, finding, and decision needed to finish the task; drop repetition and chatter. Reply with prose only — no JSON, no tool calls.";
 
-const FETCH_SUMMARY_PROMPT: &str = "You compress a web page an AI agent just fetched, toward a specific task. Preserve every fact, URL, identifier, number, quote, name, and finding relevant to that task; drop navigation, ads, and boilerplate. Reply with prose only — no JSON, no tool calls.";
+const SAVED_SUMMARY_PROMPT: &str = "You summarize a saved tool result for an AI agent, toward a focus. Keep every fact, URL, identifier, number, quote, name and finding that serves the focus. Drop navigation, ads, boilerplate and repetition. Reply with prose only, with no JSON and no tool calls.";
 
 const FINAL_DIRECTIVE: &str = "You have reached this run's step or size limit. Reply now with EXACTLY one final action and no tool calls: {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]}. Base the answer on what you already have.";
 
@@ -89,6 +85,9 @@ struct FinalAction {
 struct ToolObservation {
     action: String,
     status: String,
+    /// The scratch key the result is saved under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     args: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,7 +124,13 @@ fn run_agent() -> anyhow::Result<()> {
         anyhow::bail!("input is required");
     }
 
-    let mut system_prompt = build_system_prompt(&inp.capabilities)?;
+    // Saving needs core.scratch on the menu with store granted, because the
+    // model reads saved results through it. Summarize reads them back with get.
+    let scratch_ops = scratch_operations(&inp.capabilities);
+    let saves = scratch_ops.iter().any(|op| op == "store");
+    let summarizes = saves && scratch_ops.iter().any(|op| op == "get");
+
+    let mut system_prompt = build_system_prompt(&inp.capabilities, saves, summarizes)?;
     if inp.attempt > 1 {
         system_prompt.push_str(&format!(
             "\nThis is attempt {} of this task; earlier attempts were rolled back.",
@@ -145,12 +150,6 @@ fn run_agent() -> anyhow::Result<()> {
     for cap in inp.capabilities.iter().filter(|c| !c.hidden) {
         allowed.insert(cap.name.as_str());
     }
-    // Whether a large read can be offloaded to scratch: core.scratch must be
-    // granted and visible — a hidden grant the model can't search is no use for
-    // this, so it falls back to an inline summary instead. Scratch is the
-    // session's own store: an offloaded page stays inside this session.
-    let has_scratch = allowed.contains("core.scratch");
-
     for (i, msg) in inp.history.iter().enumerate() {
         if msg.role != "user" && msg.role != "assistant" {
             anyhow::bail!("history message {} has unsupported role {:?}", i, msg.role);
@@ -161,8 +160,8 @@ fn run_agent() -> anyhow::Result<()> {
         messages.push(msg.clone());
     }
 
-    // Capture the task before the move — it conditions the summary of any large
-    // read offloaded to the store, so the summary keeps what this run needs.
+    // Capture the task before the move: it is the default focus of a
+    // summarize action.
     let task = inp.input.clone();
     messages.push(Message {
         role: "user".into(),
@@ -245,6 +244,11 @@ fn run_agent() -> anyhow::Result<()> {
             if envelope.action == "final" {
                 continue;
             }
+            if envelope.action == "summarize" && summarizes {
+                emit_progress(&envelope.action);
+                observations.push(summarize_saved(&envelope.content, &task)?);
+                continue;
+            }
             if !allowed.contains(envelope.action.as_str()) {
                 anyhow::bail!(
                     "action {} requested unavailable capability {:?}",
@@ -266,37 +270,23 @@ fn run_agent() -> anyhow::Result<()> {
                 sdk::dispatch(&tool_call)?
             };
             // A fetched web page comes back as raw HTML; strip it to readable
-            // text so a single page can't flood the model's context. Guarded to
-            // GET responses whose content-type is text/html, so JSON API
-            // responses are left byte-for-byte intact. Then, if the (stripped)
-            // body is still large, offload it to the store and replace it with a
-            // summary + excerpt + key the model can search on demand.
+            // text before it is saved or shown. Guarded to GET responses whose
+            // content-type is text/html, so JSON API responses are left
+            // byte-for-byte intact.
             if response.status == sdk::STATUS_RESULT {
                 strip_internet_html(&envelope.action, &envelope.content, &mut response.result);
-                maybe_offload_internet(
-                    &envelope.action,
-                    &envelope.content,
-                    &mut response.result,
-                    &task,
-                    has_scratch,
-                )?;
             }
             let obs = if response.status == sdk::STATUS_FAILED {
                 ToolObservation {
                     action: envelope.action.clone(),
                     status: sdk::STATUS_FAILED.into(),
+                    key: None,
                     args: Some(envelope.content.clone()),
                     content: None,
                     error: Some(response.message),
                 }
             } else {
-                ToolObservation {
-                    action: envelope.action.clone(),
-                    status: response.status.clone(),
-                    args: Some(envelope.content.clone()),
-                    content: response.result,
-                    error: None,
-                }
+                observe_result(&envelope.action, &envelope.content, response.result, saves)?
             };
             observations.push(obs);
         }
@@ -583,141 +573,177 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
     }
 }
 
-// maybe_offload_internet keeps one large read from flooding the window: when a
-// successful core.internet GET body (after HTML stripping) exceeds
-// OFFLOAD_THRESHOLD, the full body is stored in session scratch under a
-// content-addressed key and the observation's `body` is replaced with a
-// task-conditioned summary, a short verbatim excerpt, and that key — framed so
-// the model treats it as a pointer, not the content, and reaches for
-// core.scratch search (never get) to read on. Without a usable scratch grant,
-// or if the store write fails, it still shrinks the body to the summary +
-// excerpt inline rather than passing the whole page on.
-fn maybe_offload_internet(
+// observe_result builds the observation of a successful tool call. It saves the
+// result first, so the observation can name its key. A result up to
+// INLINE_LIMIT is shown whole. A larger one is shown as its size and head, so
+// it cannot flood the window. Scratch's own results and the runtime's sys.*
+// calls are not saved: they are not IO.
+fn observe_result(
     action: &str,
     args: &Value,
-    result: &mut Option<Value>,
-    task: &str,
-    has_scratch: bool,
-) -> anyhow::Result<()> {
-    if action != "core.internet" {
-        return Ok(());
-    }
-    let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if !method.eq_ignore_ascii_case("get") {
-        return Ok(());
-    }
-    let body = match result.as_ref() {
-        Some(Value::Object(obj)) => match obj.get("body") {
-            Some(Value::String(body)) if body.len() > OFFLOAD_THRESHOLD => body.clone(),
-            _ => return Ok(()),
-        },
-        _ => return Ok(()),
-    };
-    let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let key = format!("fetch/{}", content_hash(&body));
-
-    // Store the full body first (best-effort), then summarize a bounded prefix.
-    let stored = has_scratch && store_blob(&key, &body).is_ok();
-    let excerpt = head_excerpt(&body, FETCH_EXCERPT_BYTES);
-    let summary = summarize_fetch(task, url, truncate_bytes(&body, HARD_CEILING))?;
-
-    // Rebuild the observation: keep the response's other fields (url, status,
-    // headers), drop the raw body, and add the offload fields + guidance.
-    let mut offloaded = serde_json::Map::new();
-    if let Some(Value::Object(orig)) = result.as_ref() {
-        for (k, v) in orig {
-            if k != "body" {
-                offloaded.insert(k.clone(), v.clone());
-            }
+    result: Option<Value>,
+    saves: bool,
+) -> anyhow::Result<ToolObservation> {
+    let key = match &result {
+        Some(value) if saves && action != "core.scratch" && !action.starts_with("sys.") => {
+            save_result(value)?
         }
-    }
-    let stored_key = stored.then_some(key.as_str());
-    offloaded.insert("bytes".into(), Value::Number((body.len() as u64).into()));
-    offloaded.insert("excerpt".into(), Value::String(excerpt));
-    offloaded.insert("summary".into(), Value::String(summary));
-    if let Some(k) = stored_key {
-        offloaded.insert("stored_key".into(), Value::String(k.to_string()));
-    }
-    offloaded.insert(
-        "note".into(),
-        Value::String(offload_note(body.len(), stored_key)),
-    );
-    *result = Some(Value::Object(offloaded));
-    Ok(())
+        _ => None,
+    };
+    let text = result.as_ref().map(Value::to_string).unwrap_or_default();
+    let content = if text.len() <= INLINE_LIMIT {
+        result
+    } else {
+        Some(serde_json::json!({
+            "bytes": text.len(),
+            "excerpt": head_excerpt(&text, EXCERPT_BYTES),
+            "note": large_result_note(text.len(), key.as_deref()),
+        }))
+    };
+    Ok(ToolObservation {
+        action: action.to_string(),
+        status: sdk::STATUS_RESULT.into(),
+        key,
+        args: Some(args.clone()),
+        content,
+        error: None,
+    })
 }
 
-// offload_note frames the offloaded observation for the model: it is a pointer,
-// not the content, and the way to read on is core.scratch search — never get,
-// which returns the whole large value and re-floods context.
-fn offload_note(bytes: usize, stored_key: Option<&str>) -> String {
-    match stored_key {
-        Some(key) => format!(
-            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response — the full text is NOT in this conversation. It is stored in this session's scratch memory under the key \"{key}\". To read specific details, call core.scratch search on that key (a bounded regex grep over the stored value). Do NOT call get on it — get returns the whole large value and would re-flood this context."
-        ),
-        None => format!(
-            "This is a SUMMARY and head EXCERPT of a large {bytes}-byte response; the full text could not be stored and is NOT available. Work from this, or re-fetch a narrower page."
-        ),
-    }
-}
-
-// store_blob writes a value into session scratch under key (best-effort).
-// A denied grant or an over-cap value comes back as an error or a failed status;
-// either way the caller falls back to an inline summary, so this never aborts
-// the run.
-fn store_blob(key: &str, value: &str) -> anyhow::Result<()> {
-    let args = serde_json::json!({ "operation": "put", "key": key, "value": value });
+// save_result saves a tool result in session scratch and returns its key. A
+// save that fails leaves the result unsaved, and its observation has no key.
+fn save_result(value: &Value) -> anyhow::Result<Option<String>> {
     let response = sdk::dispatch(&Call {
         name: "core.scratch".into(),
-        args: Some(args),
+        args: Some(serde_json::json!({ "operation": "store", "value": value })),
     })?;
     if response.status != sdk::STATUS_RESULT {
-        anyhow::bail!("scratch put failed: {}", response.message);
+        return Ok(None);
     }
-    Ok(())
+    Ok(response
+        .result
+        .as_ref()
+        .and_then(|r| r.get("key"))
+        .and_then(Value::as_str)
+        .map(String::from))
 }
 
-// summarize_fetch compresses one fetched page toward the run's task, so the
-// summary keeps the details this run needs and drops the rest. A self-contained
-// chat, like summarize().
-fn summarize_fetch(task: &str, url: &str, body: &str) -> anyhow::Result<String> {
-    // chat_within_budget (not a bare llm_chat) so a body at HARD_CEILING still
-    // fits when the host's max_request_bytes is set below the 1 MiB default: it
-    // sheds the body and retries rather than failing the summary.
+// large_result_note tells the model that it sees only the head of a result, and
+// how to read on.
+fn large_result_note(bytes: usize, key: Option<&str>) -> String {
+    match key {
+        Some(key) => format!(
+            "This result is {bytes} bytes, so only its head is shown here. The whole result is saved under the key \"{key}\". Use core.scratch search on that key to find details. Do not use get on it: get puts the whole result into this conversation."
+        ),
+        None => format!("This result is {bytes} bytes, so only its head is shown here."),
+    }
+}
+
+// summarize_saved serves the summarize action. It reads a saved value with
+// core.scratch get and summarizes it toward the focus in a separate chat, so the
+// value never enters this conversation and only the summary does. Of a value
+// larger than HARD_CEILING, the head is summarized, and the observation says how
+// much.
+fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservation> {
+    let observation =
+        |status: &str, content_out: Option<Value>, error: Option<String>| ToolObservation {
+            action: "summarize".into(),
+            status: status.into(),
+            key: None,
+            args: Some(content.clone()),
+            content: content_out,
+            error,
+        };
+    let failed = |error: String| observation(sdk::STATUS_FAILED, None, Some(error));
+
+    let Some(key) = content.get("key").and_then(Value::as_str) else {
+        return Ok(failed("summarize needs the key of a saved value".into()));
+    };
+    let focus = content
+        .get("focus")
+        .and_then(Value::as_str)
+        .filter(|f| !f.trim().is_empty())
+        .unwrap_or(task);
+    let response = sdk::dispatch(&Call {
+        name: "core.scratch".into(),
+        args: Some(serde_json::json!({ "operation": "get", "key": key })),
+    })?;
+    if response.status != sdk::STATUS_RESULT {
+        return Ok(failed(response.message));
+    }
+    let value = match response.result {
+        Some(Value::Object(mut found)) if found.get("found") == Some(&Value::Bool(true)) => {
+            found.remove("value").unwrap_or(Value::Null)
+        }
+        _ => return Ok(failed(format!("no value is saved under {key}"))),
+    };
+    let text = match value {
+        Value::String(text) => text,
+        other => serde_json::to_string_pretty(&other)?,
+    };
+    let covered = truncate_bytes(&text, HARD_CEILING);
     let mut msgs = [
         Message {
             role: "system".into(),
-            content: FETCH_SUMMARY_PROMPT.into(),
+            content: SAVED_SUMMARY_PROMPT.into(),
         },
         Message {
             role: "user".into(),
             content: format!(
-                "The agent is working on this task:\n{}\n\nSummarize the page below (fetched from {}) toward that task:\n\n{}",
-                truncate_bytes(task, 512),
-                url,
-                body
+                "Focus:\n{}\n\nSaved value {}:\n\n{}",
+                truncate_bytes(focus, 512),
+                key,
+                covered
             ),
         },
     ];
-    chat_within_budget(&mut msgs)
+    let summary = match chat_within_budget(&mut msgs) {
+        Ok(summary) => summary,
+        Err(e) if sdk::yielded(&e) => return Err(e),
+        Err(e) => return Ok(failed(e.to_string())),
+    };
+    let mut out = serde_json::json!({ "key": key, "summary": summary });
+    if covered.len() < text.len() {
+        out["note"] = Value::String(format!(
+            "The summary covers the first {} of {} bytes. Use core.scratch search on the key for the rest.",
+            covered.len(),
+            text.len()
+        ));
+    }
+    Ok(observation(sdk::STATUS_RESULT, Some(out), None))
 }
 
-// content_hash is a short, replay-stable hex digest of a value — the fetch key,
-// so the same page fetched twice addresses one stored blob. DefaultHasher's keys
-// are fixed (not randomized), so the digest is identical across a resume's
-// replay; it is a cache key, not a security digest.
-fn content_hash(s: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+// scratch_operations lists the core.scratch operations on this run's menu, read
+// from the entry's input schema: one branch per operation, each fixing
+// "operation" with a const.
+fn scratch_operations(capabilities: &[Capability]) -> Vec<String> {
+    let Some(scratch) = capabilities
+        .iter()
+        .find(|c| c.name == "core.scratch" && !c.hidden)
+    else {
+        return Vec::new();
+    };
+    let schema = &scratch.input_schema;
+    let branches: Vec<&Value> = match schema.get("oneOf").and_then(Value::as_array) {
+        Some(branches) => branches.iter().collect(),
+        None => vec![schema],
+    };
+    branches
+        .iter()
+        .filter_map(|b| {
+            b.pointer("/properties/operation/const")
+                .and_then(Value::as_str)
+        })
+        .map(String::from)
+        .collect()
 }
 
 // head_excerpt returns the first max bytes of s (on a char boundary) with a
-// marker when it was cut, so the model keeps verbatim anchor text (exact URLs,
-// names, numbers) the lossy summary might drop.
+// marker when it was cut, so the model can tell a head from a whole value.
 fn head_excerpt(s: &str, max: usize) -> String {
     let head = truncate_bytes(s, max);
     if head.len() < s.len() {
-        format!("{head}\n…[excerpt only — full text stored, not shown]")
+        format!("{head}\n…[only the head is shown]")
     } else {
         head.to_string()
     }
@@ -806,7 +832,11 @@ fn collapse_ws(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn build_system_prompt(capabilities: &[Capability]) -> anyhow::Result<String> {
+fn build_system_prompt(
+    capabilities: &[Capability],
+    saves: bool,
+    summarizes: bool,
+) -> anyhow::Result<String> {
     let mut prompt = String::new();
     prompt.push_str(PROTOCOL_PROMPT);
     prompt.push_str("\n\nAvailable tools for this run:");
@@ -840,6 +870,15 @@ fn build_system_prompt(capabilities: &[Capability]) -> anyhow::Result<String> {
     prompt.push_str(
         r#"{"actions":[{"action":"<exact tool name>","content":<input matching that tool's schema>}]}"#,
     );
+    if saves {
+        prompt.push_str("\n\nEvery successful tool result is saved in this session's scratch memory, under the key that its observation gives as \"key\". A saved result never changes, and it stays available in later messages of this session. A large result shows only its head: use core.scratch search on its key to find details.");
+    }
+    if summarizes {
+        prompt.push_str(" To get an overview of a saved result without reading it here, use the summarize action. It summarizes the result in a separate conversation and returns only the summary:\n");
+        prompt.push_str(
+            r#"{"actions":[{"action":"summarize","content":{"key":"<key>","focus":"<what you need from it>"}}]}"#,
+        );
+    }
     Ok(prompt)
 }
 
@@ -864,6 +903,7 @@ fn emit_progress(action: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // Salvage returns the model's prose verbatim (trimmed) as the answer.
     #[test]
@@ -925,37 +965,44 @@ mod tests {
 
     // -- large-read offload helpers --
 
-    // The content hash is stable for a given input (so a resume's replay
-    // addresses the same stored blob) and separates distinct inputs.
-    #[test]
-    fn content_hash_is_stable_and_distinct() {
-        assert_eq!(content_hash("the same page"), content_hash("the same page"));
-        assert_ne!(content_hash("page a"), content_hash("page b"));
-        assert_eq!(content_hash("x").len(), 16);
-    }
-
     // The excerpt is verbatim when it fits and carries a cut marker when it
-    // doesn't, so the model can tell a partial excerpt from a whole small body.
+    // doesn't, so the model can tell a head from a whole small value.
     #[test]
     fn head_excerpt_marks_truncation() {
         assert_eq!(head_excerpt("short", 100), "short");
         let cut = head_excerpt("abcdefghij", 4);
         assert!(cut.starts_with("abcd"));
-        assert!(cut.contains("excerpt only"));
+        assert!(cut.contains("only the head"));
     }
 
-    // The stored-key note steers to search and warns off get; the no-store note
-    // says only the summary+excerpt remains. Both must read as "not the content".
+    // A saved large result points at its key and steers to search, away from
+    // get. An unsaved one says only that the head is shown.
     #[test]
-    fn offload_note_directs_to_search_when_stored() {
-        let stored = offload_note(900_000, Some("fetch/abc"));
-        assert!(stored.contains("fetch/abc"));
-        assert!(stored.contains("search"));
-        assert!(stored.contains("NOT"));
-        assert!(stored.to_lowercase().contains("do not call get"));
+    fn large_result_note_points_at_the_key() {
+        let saved = large_result_note(900_000, Some("io/abc"));
+        assert!(saved.contains("io/abc"));
+        assert!(saved.contains("search"));
+        assert!(saved.contains("Do not use get"));
+        assert!(!large_result_note(900_000, None).contains("io/"));
+    }
 
-        let missing = offload_note(900_000, None);
-        assert!(missing.contains("could not be stored"));
-        assert!(!missing.contains("fetch/"));
+    // The granted scratch operations are read from the menu schema: a oneOf of
+    // branches, or one branch alone. A hidden grant is not on the menu.
+    #[test]
+    fn scratch_operations_reads_the_menu_schema() {
+        let branch = |op: &str| json!({"properties": {"operation": {"const": op}}});
+        let scratch = |schema: Value, hidden: bool| Capability {
+            name: "core.scratch".into(),
+            input_schema: schema,
+            hidden,
+            ..Capability::default()
+        };
+        let both = scratch(json!({"oneOf": [branch("get"), branch("store")]}), false);
+        assert_eq!(scratch_operations(&[both]), vec!["get", "store"]);
+        assert_eq!(
+            scratch_operations(&[scratch(branch("search"), false)]),
+            vec!["search"]
+        );
+        assert!(scratch_operations(&[scratch(branch("store"), true)]).is_empty());
     }
 }
