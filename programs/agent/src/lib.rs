@@ -42,11 +42,11 @@ const KEEP_RECENT: usize = 6;
 
 // Every successful tool result is saved in session scratch with core.scratch
 // store, under an io/ key made from its content. A saved result goes into the
-// transcript only as its key, its size and an excerpt of its first
-// EXCERPT_BYTES, so no read can flood the window. The model reads on with
-// core.scratch search, or with the summarize action, which summarizes a saved
-// value in a separate chat of at most HARD_CEILING. A result that is not saved
-// has no key to read on from, so it goes in whole up to INLINE_LIMIT.
+// transcript only as its key and its size, so no read can flood the window. The
+// model reads it with core.scratch, or with the summarize action, which
+// summarizes a saved value in a separate chat of at most HARD_CEILING. A result
+// that is not saved has no key to read from, so it goes in whole up to
+// INLINE_LIMIT, else as its size and its first EXCERPT_BYTES.
 const INLINE_LIMIT: usize = 48 * 1024;
 const EXCERPT_BYTES: usize = 2 * 1024;
 
@@ -86,9 +86,6 @@ struct FinalAction {
 struct ToolObservation {
     action: String,
     status: String,
-    /// The scratch key the result is saved under.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     args: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +165,9 @@ fn run_agent() -> anyhow::Result<()> {
         role: "user".into(),
         content: inp.input,
     });
+    // The head compaction never touches: the system prompt, the session
+    // history and this run's input.
+    let head = messages.len();
 
     let mut step: u32 = 0;
     loop {
@@ -182,11 +182,11 @@ fn run_agent() -> anyhow::Result<()> {
         let turn = sdk::savepoint()?;
 
         // Keep the transcript within the model's window: once it crosses
-        // COMPACT_THRESHOLD, summarize the oldest messages (never the system
-        // prompt or the newest turns) into one message. The summary is itself a
-        // journaled LLM call, so a crash-resume rebuilds the same compacted
+        // COMPACT_THRESHOLD, summarize the oldest of the run's own turns (never
+        // the head or the newest turns) into one message. The summary is itself
+        // a journaled LLM call, so a crash-resume rebuilds the same compacted
         // history by replay.
-        maybe_compact(&mut messages)?;
+        maybe_compact(&mut messages, head)?;
 
         // Bound the run. At the step budget — or if the transcript is still near
         // the hard ceiling even after compaction — demand a final answer this
@@ -281,7 +281,6 @@ fn run_agent() -> anyhow::Result<()> {
                 ToolObservation {
                     action: envelope.action.clone(),
                     status: sdk::STATUS_FAILED.into(),
-                    key: None,
                     args: Some(envelope.content.clone()),
                     content: None,
                     error: Some(response.message),
@@ -368,26 +367,28 @@ fn messages_bytes(messages: &[Message]) -> usize {
         .unwrap_or(0)
 }
 
-// maybe_compact summarizes the oldest messages when the transcript grows past
-// COMPACT_THRESHOLD, keeping messages[0] (the system prompt: protocol + tool
-// menu) and the last KEEP_RECENT turns verbatim, and replacing the middle with a
-// single summary message. No-op below the threshold or when there is too little
-// middle to gain anything.
-fn maybe_compact(messages: &mut Vec<Message>) -> anyhow::Result<()> {
-    if messages_bytes(messages) < COMPACT_THRESHOLD || messages.len() <= KEEP_RECENT + 2 {
+// maybe_compact summarizes the oldest of the run's own turns when the
+// transcript grows past COMPACT_THRESHOLD. It keeps the first `head` messages
+// verbatim — the system prompt, the session history and the run's input, which
+// can carry instructions that must not be paraphrased — and the last
+// KEEP_RECENT, and replaces the turns between them with one summary message.
+// No-op below the threshold or when there is too little between them to gain
+// anything.
+fn maybe_compact(messages: &mut Vec<Message>, head: usize) -> anyhow::Result<()> {
+    if messages_bytes(messages) < COMPACT_THRESHOLD || messages.len() <= head + KEEP_RECENT + 1 {
         return Ok(());
     }
     let split = messages.len() - KEEP_RECENT;
     let mut middle = String::new();
-    for m in &messages[1..split] {
+    for m in &messages[head..split] {
         middle.push_str(&m.role);
         middle.push_str(": ");
         middle.push_str(&m.content);
         middle.push_str("\n\n");
     }
     let summary = summarize(&middle)?;
-    let mut rebuilt = Vec::with_capacity(2 + KEEP_RECENT);
-    rebuilt.push(messages[0].clone());
+    let mut rebuilt = Vec::with_capacity(head + 1 + KEEP_RECENT);
+    rebuilt.extend_from_slice(&messages[..head]);
     rebuilt.push(Message {
         role: "user".into(),
         content: format!("[Earlier steps, compacted to save context]\n{}", summary),
@@ -574,37 +575,34 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
     }
 }
 
-// observe_result builds the observation of a successful tool call. It saves the
-// result first, and a saved result is shown as its size and an excerpt, with a
-// note that names its key. An unsaved result is shown whole up to INLINE_LIMIT,
-// else as its size and head. Scratch's own results and the runtime's sys.*
-// calls are not saved: they are not IO.
+// observe_result builds the observation of a successful tool call. A saved
+// result is shown only as its key and its size: the model reads it through
+// core.scratch, or summarizes it. Scratch's own results are not saved, because
+// they are how the model reads: they come back whole. An unsaved result comes
+// back whole up to INLINE_LIMIT, else as its size and head.
 fn observe_result(
     action: &str,
     args: &Value,
     result: Option<Value>,
     saves: bool,
 ) -> anyhow::Result<ToolObservation> {
+    let text = result.as_ref().map(Value::to_string).unwrap_or_default();
     let key = match &result {
-        Some(value) if saves && action != "core.scratch" && !action.starts_with("sys.") => {
-            save_result(value)?
-        }
+        Some(value) if saves && action != "core.scratch" => save_result(value)?,
         _ => None,
     };
-    let text = result.as_ref().map(Value::to_string).unwrap_or_default();
-    let content = if key.is_none() && text.len() <= INLINE_LIMIT {
-        result
-    } else {
-        Some(serde_json::json!({
-            "bytes": text.len(),
+    let content = match key {
+        Some(key) => Some(serde_json::json!({ "key": key, "bytes_length": text.len() })),
+        None if text.len() <= INLINE_LIMIT => result,
+        None => Some(serde_json::json!({
+            "bytes_length": text.len(),
             "excerpt": head_excerpt(&text, EXCERPT_BYTES),
-            "note": excerpt_note(text.len(), key.as_deref()),
-        }))
+            "note": "The excerpt is the head of the result. The result is not saved.",
+        })),
     };
     Ok(ToolObservation {
         action: action.to_string(),
         status: sdk::STATUS_RESULT.into(),
-        key,
         args: Some(args.clone()),
         content,
         error: None,
@@ -629,20 +627,6 @@ fn save_result(value: &Value) -> anyhow::Result<Option<String>> {
         .map(String::from))
 }
 
-// excerpt_note tells the model whether the excerpt is the whole result, where the
-// result is saved, and how to read on.
-fn excerpt_note(bytes: usize, key: Option<&str>) -> String {
-    match key {
-        Some(key) if bytes <= EXCERPT_BYTES => {
-            format!("The excerpt is the whole result. It is saved under the key \"{key}\".")
-        }
-        Some(key) => format!(
-            "The excerpt is the head of a {bytes}-byte result. The whole result is saved under the key \"{key}\". Use core.scratch search on that key to find details. Do not use get on it: get puts the whole result into this conversation."
-        ),
-        None => format!("The excerpt is the head of a {bytes}-byte result. The result is not saved."),
-    }
-}
-
 // summarize_saved serves the summarize action. It reads a saved value with
 // core.scratch get and summarizes it toward the focus in a separate chat, so the
 // value never enters this conversation and only the summary does. Of a value
@@ -653,7 +637,6 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
         |status: &str, content_out: Option<Value>, error: Option<String>| ToolObservation {
             action: "summarize".into(),
             status: status.into(),
-            key: None,
             args: Some(content.clone()),
             content: content_out,
             error,
@@ -875,7 +858,7 @@ fn build_system_prompt(
         r#"{"actions":[{"action":"<exact tool name>","content":<input matching that tool's schema>}]}"#,
     );
     if saves {
-        prompt.push_str("\n\nEvery successful tool result is saved in this session's scratch memory, under the key that its observation gives as \"key\". The observation shows the result's size in bytes and an excerpt: the whole result when it is short, else its head. A saved result never changes, and it stays available in later messages of this session. Use core.scratch search on a key to find details in a result.");
+        prompt.push_str("\n\nEvery successful tool result, except core.scratch's own, is saved in this session's scratch memory. In place of the result, its observation gives {\"key\", \"bytes_length\"}. A saved result never changes, and it stays available in later messages of this session. Read a result with core.scratch: get returns it whole, and search finds lines in it.");
     }
     if summarizes {
         prompt.push_str(" To get an overview of a saved result without reading it here, use the summarize action. It summarizes the result in a separate conversation and returns only the summary:\n");
@@ -977,18 +960,6 @@ mod tests {
         let cut = head_excerpt("abcdefghij", 4);
         assert!(cut.starts_with("abcd"));
         assert!(cut.contains("only the head"));
-    }
-
-    // The note says whether the excerpt is the whole result, names the key of a
-    // saved one, and steers a long one to search, away from get.
-    #[test]
-    fn excerpt_note_points_at_the_key() {
-        let short = excerpt_note(100, Some("io/abc"));
-        assert!(short.contains("whole result") && short.contains("io/abc"));
-        let long = excerpt_note(900_000, Some("io/abc"));
-        assert!(long.contains("head") && long.contains("io/abc"));
-        assert!(long.contains("search") && long.contains("Do not use get"));
-        assert!(excerpt_note(900_000, None).contains("not saved"));
     }
 
     // The granted scratch operations are read from the menu schema: a oneOf of
