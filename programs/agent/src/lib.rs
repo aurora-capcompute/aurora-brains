@@ -18,7 +18,7 @@ You may request multiple independent tool calls in one turn. The host executes t
 Each observation has status \"result\" with content or status \"failed\" with an error. A failed tool call is recoverable: use other sources, retry when appropriate, or explain the limitation.\n\
 Sections: {\"action\":\"sys.begin\",\"content\":{}} opens a section and {\"action\":\"sys.commit\",\"content\":{}} closes it. Open a section only around steps that are safe to run again. Sections nest.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
-{\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish, or\n\
+{\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\"}}]} to finish, or\n\
 {\"actions\":[{\"action\":\"sys.abort\",\"content\":{\"reason\":\"...\"}}]} to abandon. With a section open, the run goes back to the start of the outermost open section and you decide again from there, at most 10 times. With no section open, the process stops as failed with that reason. Nothing that already ran is undone.\n\
 Never combine a terminal action with tool calls in the same actions array.";
 
@@ -58,7 +58,7 @@ const SUMMARY_PROMPT: &str = "You compress an AI agent's earlier working log. Pr
 
 const SAVED_SUMMARY_PROMPT: &str = "You summarize a saved tool result for an AI agent, toward a focus. Keep every fact, URL, identifier, number, quote, name and finding that serves the focus. Drop navigation, ads, boilerplate and repetition. Reply with prose only, with no JSON and no tool calls.";
 
-const FINAL_DIRECTIVE: &str = "You have reached this run's step or size limit. Reply now with EXACTLY one final action and no tool calls: {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]}. Base the answer on what you already have.";
+const FINAL_DIRECTIVE: &str = "You have reached this run's step or size limit. Reply now with EXACTLY one final action and no tool calls: {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\"}}]}. Base the answer on what you already have.";
 
 // -- Data structures --
 
@@ -79,11 +79,6 @@ struct Input {
     /// know earlier attempts were rolled back and back off accordingly.
     #[serde(default)]
     attempt: u32,
-}
-
-#[derive(Deserialize)]
-struct FinalAction {
-    answer: String,
 }
 
 #[derive(Serialize)]
@@ -203,17 +198,16 @@ fn run_agent() -> anyhow::Result<()> {
             // gets the parse error back and replies again.
             Err(e) => {
                 if looks_like_tool_batch(&chat) && recover_answer_field(&chat).is_none() {
-                    messages.push(Message {
-                        role: "assistant".into(),
-                        content: chat,
-                    });
-                    messages.push(Message {
-                        role: "user".into(),
-                        content: format!("Your reply did not parse as an actions batch ({e}). Reply again with exactly one valid JSON object."),
-                    });
+                    reply_again(&mut messages, chat, format!("Your reply did not parse as an actions batch ({e}). Reply again with exactly one valid JSON object."));
                     continue;
                 }
-                return wrap_up(&chat);
+                match wrap_up(&chat)? {
+                    Ok(()) => return Ok(()),
+                    Err(reason) => {
+                        reply_again(&mut messages, chat, answer_rejected(&reason));
+                        continue;
+                    }
+                }
             }
         };
 
@@ -227,7 +221,13 @@ fn run_agent() -> anyhow::Result<()> {
                 return sdk::abort(&abort_reason(envelope));
             }
             if let Some(envelope) = envelopes.iter().find(|e| e.action == "final") {
-                return output_final(envelope);
+                match publish_final(envelope)? {
+                    Ok(()) => return Ok(()),
+                    Err(reason) => {
+                        reply_again(&mut messages, chat, answer_rejected(&reason));
+                        continue;
+                    }
+                }
             }
         }
 
@@ -432,14 +432,33 @@ fn summarize(excerpt: &str) -> anyhow::Result<String> {
 // finalize forces the run to a close by asking the model for exactly one final
 // action. If the model complies, that answer is published; if it still refuses
 // (returns tools, or unparseable), its best text is salvaged so the run always
-// terminates with an answer.
+// terminates with an answer. At the limit there is no turn left to correct an
+// answer the host rejects, so a rejection fails the process.
 fn finalize(messages: &mut Vec<Message>) -> anyhow::Result<()> {
     messages.push(Message {
         role: "user".into(),
         content: FINAL_DIRECTIVE.into(),
     });
     let chat = chat_within_budget(messages)?;
-    wrap_up(&chat)
+    wrap_up(&chat)?.map_err(|reason| anyhow::anyhow!("the final answer was not accepted: {reason}"))
+}
+
+// reply_again puts the model's reply and a note on what was wrong with it into
+// the transcript, so the model can reply again in its next turn.
+fn reply_again(messages: &mut Vec<Message>, reply: String, note: String) {
+    messages.push(Message {
+        role: "assistant".into(),
+        content: reply,
+    });
+    messages.push(Message {
+        role: "user".into(),
+        content: note,
+    });
+}
+
+// answer_rejected is the note on a final answer that was not accepted.
+fn answer_rejected(reason: &str) -> String {
+    format!("Your final answer was not accepted: {reason}. Reply again with a final action whose answer fits.")
 }
 
 // wrap_up ends the run from a model reply that ought to carry a terminal
@@ -447,14 +466,14 @@ fn finalize(messages: &mut Vec<Message>) -> anyhow::Result<()> {
 // usable answer from it. Shared by the step/size-limit path (finalize) and the
 // recovery when a mid-loop reply doesn't parse as the action envelope at all —
 // so a model that simply answered in prose finishes the process instead of
-// failing it.
-fn wrap_up(chat: &str) -> anyhow::Result<()> {
+// failing it. An answer the host rejects comes back as its reason.
+fn wrap_up(chat: &str) -> anyhow::Result<Result<(), String>> {
     if let Ok(envelopes) = decode_model_envelopes(chat) {
-        if let Some(idx) = envelopes.iter().position(|e| e.action == "final") {
-            return output_final(&envelopes[idx]);
+        if let Some(envelope) = envelopes.iter().find(|e| e.action == "final") {
+            return publish_final(envelope);
         }
-        if let Some(idx) = envelopes.iter().position(|e| e.action == "sys.abort") {
-            return sdk::abort(&abort_reason(&envelopes[idx]));
+        if let Some(envelope) = envelopes.iter().find(|e| e.action == "sys.abort") {
+            return sdk::abort(&abort_reason(envelope)).map(Ok);
         }
     }
     sdk::output(&FinishArgs {
@@ -885,18 +904,18 @@ fn build_system_prompt(
     Ok(prompt)
 }
 
-fn output_final(envelope: &ModelEnvelope) -> anyhow::Result<()> {
-    if envelope.content.is_null() {
-        anyhow::bail!("invalid final action: content is required");
+// publish_final publishes a final action's answer. A final with no answer, and
+// an answer the host rejects against the program's output schema, come back as
+// the reason, so the model can answer again.
+fn publish_final(envelope: &ModelEnvelope) -> anyhow::Result<Result<(), String>> {
+    match envelope.content.get("answer").and_then(Value::as_str) {
+        Some(answer) if !answer.is_empty() => sdk::output(&FinishArgs {
+            answer: answer.to_string(),
+        }),
+        _ => Ok(Err(
+            "a final action needs a non-empty \"answer\" string".into()
+        )),
     }
-    let action: FinalAction = serde_json::from_value(envelope.content.clone())
-        .map_err(|e| anyhow::anyhow!("invalid final action: {}", e))?;
-    if action.answer.is_empty() {
-        anyhow::bail!("final action missing answer");
-    }
-    sdk::output(&FinishArgs {
-        answer: action.answer,
-    })
 }
 
 fn emit_progress(action: &str) {

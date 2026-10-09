@@ -214,18 +214,19 @@ pub fn input<T: DeserializeOwned>() -> anyhow::Result<T> {
 
 /// output publishes this run's result payload with the sys.output syscall.
 /// The host validates the answer against the program's declared output schema
-/// (its `interface.json` manifest); a rejected answer comes back as an error
-/// the program can react to — correct the answer and publish again.
-pub fn output<T: Serialize>(value: &T) -> anyhow::Result<()> {
+/// (its `interface.json` manifest). A rejected answer comes back as
+/// `Ok(Err(reason))`: nothing is recorded as the answer, and the program can
+/// correct it and publish again.
+pub fn output<T: Serialize>(value: &T) -> anyhow::Result<Result<(), String>> {
     let args = serde_json::to_value(value).map_err(|e| anyhow::anyhow!("encode output: {}", e))?;
     let response = dispatch(&Call {
         name: SYS_OUTPUT.into(),
         args: Some(args),
     })?;
     if response.status == STATUS_FAILED {
-        anyhow::bail!("publish output: {}", response.message);
+        return Ok(Err(response.message));
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 /// abort abandons the open critical section instead of finishing with
