@@ -41,11 +41,12 @@ const HARD_CEILING: usize = 768 * 1024;
 const KEEP_RECENT: usize = 6;
 
 // Every successful tool result is saved in session scratch with core.scratch
-// store, under an io/ key made from its content. A result up to INLINE_LIMIT
-// also goes into the transcript whole. A larger one goes in as its key, its size
-// and a head excerpt of EXCERPT_BYTES, so one big read cannot flood the window.
-// The model reads on with core.scratch search, or with the summarize action,
-// which summarizes a saved value in a separate chat of at most HARD_CEILING.
+// store, under an io/ key made from its content. A saved result goes into the
+// transcript only as its key, its size and an excerpt of its first
+// EXCERPT_BYTES, so no read can flood the window. The model reads on with
+// core.scratch search, or with the summarize action, which summarizes a saved
+// value in a separate chat of at most HARD_CEILING. A result that is not saved
+// has no key to read on from, so it goes in whole up to INLINE_LIMIT.
 const INLINE_LIMIT: usize = 48 * 1024;
 const EXCERPT_BYTES: usize = 2 * 1024;
 
@@ -574,9 +575,9 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
 }
 
 // observe_result builds the observation of a successful tool call. It saves the
-// result first, so the observation can name its key. A result up to
-// INLINE_LIMIT is shown whole. A larger one is shown as its size and head, so
-// it cannot flood the window. Scratch's own results and the runtime's sys.*
+// result first, and a saved result is shown as its size and an excerpt, with a
+// note that names its key. An unsaved result is shown whole up to INLINE_LIMIT,
+// else as its size and head. Scratch's own results and the runtime's sys.*
 // calls are not saved: they are not IO.
 fn observe_result(
     action: &str,
@@ -591,13 +592,13 @@ fn observe_result(
         _ => None,
     };
     let text = result.as_ref().map(Value::to_string).unwrap_or_default();
-    let content = if text.len() <= INLINE_LIMIT {
+    let content = if key.is_none() && text.len() <= INLINE_LIMIT {
         result
     } else {
         Some(serde_json::json!({
             "bytes": text.len(),
             "excerpt": head_excerpt(&text, EXCERPT_BYTES),
-            "note": large_result_note(text.len(), key.as_deref()),
+            "note": excerpt_note(text.len(), key.as_deref()),
         }))
     };
     Ok(ToolObservation {
@@ -628,14 +629,17 @@ fn save_result(value: &Value) -> anyhow::Result<Option<String>> {
         .map(String::from))
 }
 
-// large_result_note tells the model that it sees only the head of a result, and
-// how to read on.
-fn large_result_note(bytes: usize, key: Option<&str>) -> String {
+// excerpt_note tells the model whether the excerpt is the whole result, where the
+// result is saved, and how to read on.
+fn excerpt_note(bytes: usize, key: Option<&str>) -> String {
     match key {
+        Some(key) if bytes <= EXCERPT_BYTES => {
+            format!("The excerpt is the whole result. It is saved under the key \"{key}\".")
+        }
         Some(key) => format!(
-            "This result is {bytes} bytes, so only its head is shown here. The whole result is saved under the key \"{key}\". Use core.scratch search on that key to find details. Do not use get on it: get puts the whole result into this conversation."
+            "The excerpt is the head of a {bytes}-byte result. The whole result is saved under the key \"{key}\". Use core.scratch search on that key to find details. Do not use get on it: get puts the whole result into this conversation."
         ),
-        None => format!("This result is {bytes} bytes, so only its head is shown here."),
+        None => format!("The excerpt is the head of a {bytes}-byte result. The result is not saved."),
     }
 }
 
@@ -871,7 +875,7 @@ fn build_system_prompt(
         r#"{"actions":[{"action":"<exact tool name>","content":<input matching that tool's schema>}]}"#,
     );
     if saves {
-        prompt.push_str("\n\nEvery successful tool result is saved in this session's scratch memory, under the key that its observation gives as \"key\". A saved result never changes, and it stays available in later messages of this session. A large result shows only its head: use core.scratch search on its key to find details.");
+        prompt.push_str("\n\nEvery successful tool result is saved in this session's scratch memory, under the key that its observation gives as \"key\". The observation shows the result's size in bytes and an excerpt: the whole result when it is short, else its head. A saved result never changes, and it stays available in later messages of this session. Use core.scratch search on a key to find details in a result.");
     }
     if summarizes {
         prompt.push_str(" To get an overview of a saved result without reading it here, use the summarize action. It summarizes the result in a separate conversation and returns only the summary:\n");
@@ -975,15 +979,16 @@ mod tests {
         assert!(cut.contains("only the head"));
     }
 
-    // A saved large result points at its key and steers to search, away from
-    // get. An unsaved one says only that the head is shown.
+    // The note says whether the excerpt is the whole result, names the key of a
+    // saved one, and steers a long one to search, away from get.
     #[test]
-    fn large_result_note_points_at_the_key() {
-        let saved = large_result_note(900_000, Some("io/abc"));
-        assert!(saved.contains("io/abc"));
-        assert!(saved.contains("search"));
-        assert!(saved.contains("Do not use get"));
-        assert!(!large_result_note(900_000, None).contains("io/"));
+    fn excerpt_note_points_at_the_key() {
+        let short = excerpt_note(100, Some("io/abc"));
+        assert!(short.contains("whole result") && short.contains("io/abc"));
+        let long = excerpt_note(900_000, Some("io/abc"));
+        assert!(long.contains("head") && long.contains("io/abc"));
+        assert!(long.contains("search") && long.contains("Do not use get"));
+        assert!(excerpt_note(900_000, None).contains("not saved"));
     }
 
     // The granted scratch operations are read from the menu schema: a oneOf of

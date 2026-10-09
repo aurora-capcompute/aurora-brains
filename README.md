@@ -11,9 +11,10 @@ text, and transcript compaction.
 
 When the manifest grants `core.scratch` with `store`, the agent saves every
 successful tool result in the session's scratch memory, under a key made from
-the result's content (`io/<hash>`). A saved result never changes. The model
-gets the key with each result. A large result shows only its head, and the
-model reads on with `core.scratch search` on the key. With `get` also granted,
+the result's content (`io/<hash>`). A saved result never changes. In place
+of each result, the model gets its key, its size and an excerpt: the whole
+result when it is short (2 KiB or less), else its head. The model reads on with
+`core.scratch search` on the key. With `get` also granted,
 the model can call the `summarize` action. The agent then summarizes the saved
 result in a separate LLM chat, and only the summary enters the model's
 conversation.
