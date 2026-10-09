@@ -1,7 +1,7 @@
 use aurora_program_sdk as sdk;
 use aurora_program_sdk::llm::{
-    self, decode_model_envelopes, extract_json_region, looks_like_tool_batch, truncate_bytes,
-    Message, ModelEnvelope,
+    self, decode_model_envelopes, extract_json_region, looks_like_tool_batch, Message,
+    ModelEnvelope,
 };
 use aurora_program_sdk::{Call, Capability};
 use extism_pdk::*;
@@ -116,10 +116,9 @@ pub fn run(_: ()) -> FnResult<Json<Output>> {
 }
 
 fn run_agent() -> anyhow::Result<()> {
+    // The host checked the input against the program's interface, and it built
+    // the history from completed turns: both are trusted as they come.
     let inp: Input = sdk::input()?;
-    if inp.input.is_empty() {
-        anyhow::bail!("input is required");
-    }
 
     // Saving needs core.scratch on the menu with store granted, because the
     // model reads saved results through it. Summarize reads them back with get.
@@ -127,7 +126,7 @@ fn run_agent() -> anyhow::Result<()> {
     let saves = scratch_ops.iter().any(|op| op == "store");
     let summarizes = saves && scratch_ops.iter().any(|op| op == "get");
 
-    let mut system_prompt = build_system_prompt(&inp.capabilities, saves, summarizes)?;
+    let mut system_prompt = build_system_prompt(&inp.capabilities, saves, summarizes);
     if inp.attempt > 1 {
         system_prompt.push_str(&format!(
             "\nThis is attempt {} of this task. Earlier attempts ran and were abandoned. Their steps were not undone.",
@@ -143,19 +142,13 @@ fn run_agent() -> anyhow::Result<()> {
 
     // Hidden capabilities stay dispatchable but off this program's menu, so the
     // model never sees them and never gets to request one.
-    let mut allowed: HashSet<&str> = HashSet::with_capacity(inp.capabilities.len());
-    for cap in inp.capabilities.iter().filter(|c| !c.hidden) {
-        allowed.insert(cap.name.as_str());
-    }
-    for (i, msg) in inp.history.iter().enumerate() {
-        if msg.role != "user" && msg.role != "assistant" {
-            anyhow::bail!("history message {} has unsupported role {:?}", i, msg.role);
-        }
-        if msg.content.is_empty() {
-            anyhow::bail!("history message {} has empty content", i);
-        }
-        messages.push(msg.clone());
-    }
+    let allowed: HashSet<&str> = inp
+        .capabilities
+        .iter()
+        .filter(|c| !c.hidden)
+        .map(|c| c.name.as_str())
+        .collect();
+    messages.extend(inp.history);
 
     // Capture the task before the move: it is the default focus of a
     // summarize action.
@@ -589,16 +582,14 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
     };
     let is_html = obj
         .get("headers")
-        .and_then(|h| h.as_object())
-        .map(|headers| {
+        .and_then(Value::as_object)
+        .is_some_and(|headers| {
             headers.iter().any(|(k, v)| {
                 k.eq_ignore_ascii_case("content-type")
                     && v.as_str()
-                        .map(|s| s.to_ascii_lowercase().contains("text/html"))
-                        .unwrap_or(false)
+                        .is_some_and(|s| s.to_ascii_lowercase().contains("text/html"))
             })
-        })
-        .unwrap_or(false);
+        });
     if !is_html {
         return;
     }
@@ -705,7 +696,7 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
         Value::String(text) => text,
         other => serde_json::to_string_pretty(&other)?,
     };
-    let covered = truncate_bytes(&text, HARD_CEILING);
+    let covered = &text[..text.floor_char_boundary(HARD_CEILING)];
     let mut msgs = [
         Message {
             role: "system".into(),
@@ -715,7 +706,7 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
             role: "user".into(),
             content: format!(
                 "Focus:\n{}\n\nSaved value {}:\n\n{}",
-                truncate_bytes(focus, 512),
+                &focus[..focus.floor_char_boundary(512)],
                 key,
                 covered
             ),
@@ -760,10 +751,10 @@ fn scratch_operations(capabilities: &[Capability]) -> Vec<String> {
         .collect()
 }
 
-// head_excerpt returns the first max bytes of s (on a char boundary) with a
+// head_excerpt returns the first limit bytes of s (on a char boundary) with a
 // marker when it was cut, so the model can tell a head from a whole value.
-fn head_excerpt(s: &str, max: usize) -> String {
-    let head = truncate_bytes(s, max);
+fn head_excerpt(s: &str, limit: usize) -> String {
+    let head = &s[..s.floor_char_boundary(limit)];
     if head.len() < s.len() {
         format!("{head}\n…[only the head is shown]")
     } else {
@@ -854,11 +845,7 @@ fn collapse_ws(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn build_system_prompt(
-    capabilities: &[Capability],
-    saves: bool,
-    summarizes: bool,
-) -> anyhow::Result<String> {
+fn build_system_prompt(capabilities: &[Capability], saves: bool, summarizes: bool) -> String {
     let mut prompt = String::new();
     prompt.push_str(PROTOCOL_PROMPT);
     prompt.push_str("\n\nAvailable tools for this run:");
@@ -866,27 +853,20 @@ fn build_system_prompt(
     let visible: Vec<&Capability> = capabilities.iter().filter(|c| !c.hidden).collect();
     if visible.is_empty() {
         prompt.push_str("\nNone. Return a final action without attempting a tool call.");
-        return Ok(prompt);
+        return prompt;
     }
     for (i, tool) in visible.iter().enumerate() {
-        let name = tool.name.trim();
-        if name.is_empty() {
-            anyhow::bail!("capability {} name is required", i);
-        }
         let schema = if tool.input_schema.is_null() {
             serde_json::json!({})
         } else {
             tool.input_schema.clone()
         };
-        let compact_schema = serde_json::to_string(&schema).map_err(|e| {
-            anyhow::anyhow!("capability {:?} has invalid input schema: {}", name, e)
-        })?;
-        prompt.push_str(&format!("\n\nTool {}\nName: {}", i + 1, name));
+        prompt.push_str(&format!("\n\nTool {}\nName: {}", i + 1, tool.name));
         let description = tool.description.trim();
         if !description.is_empty() {
             prompt.push_str(&format!("\nDescription: {}", description));
         }
-        prompt.push_str(&format!("\nInput JSON schema: {}", compact_schema));
+        prompt.push_str(&format!("\nInput JSON schema: {}", schema));
     }
     prompt.push_str("\n\nTool call shape:\n");
     prompt.push_str(
@@ -901,7 +881,7 @@ fn build_system_prompt(
             r#"{"actions":[{"action":"summarize","content":{"key":"<key>","focus":"<what you need from it>"}}]}"#,
         );
     }
-    Ok(prompt)
+    prompt
 }
 
 // publish_final publishes a final action's answer. A final with no answer, and

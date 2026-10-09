@@ -145,22 +145,25 @@ pub fn extract_json_region(content: &str) -> &str {
 
 fn decode_model_envelope_object(value: Value) -> anyhow::Result<Vec<ModelEnvelope>> {
     // Skip diagnostic objects (non-empty "error" field).
-    if let Some(err_str) = value.get("error").and_then(|v| v.as_str()) {
-        if !err_str.is_empty() {
-            return Ok(vec![]);
-        }
+    if value
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|error| !error.is_empty())
+    {
+        return Ok(vec![]);
     }
 
     // Unwrap a batch wrapper that has an "actions" array.
-    if let Some(actions_val) = value.get("actions") {
-        let items: Vec<Value> = serde_json::from_value(actions_val.clone())
-            .map_err(|e| anyhow::anyhow!("actions must be an array: {}", e))?;
+    if let Some(actions) = value.get("actions") {
+        let items = actions
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("actions must be an array"))?;
         if items.is_empty() {
             anyhow::bail!("model action batch is empty");
         }
         let mut envelopes = Vec::new();
         for item in items {
-            envelopes.extend(decode_model_envelope_object(item)?);
+            envelopes.extend(decode_model_envelope_object(item.clone())?);
         }
         return Ok(envelopes);
     }
@@ -190,7 +193,7 @@ fn abbreviated_json(value: &Value, limit: usize) -> String {
     } else {
         // Clamp on a char boundary: a fixed byte slice would panic on multi-byte
         // UTF-8 in a model-authored value, and this runs while building an error.
-        format!("{}[...]", truncate_bytes(&s, limit))
+        format!("{}[...]", &s[..s.floor_char_boundary(limit)])
     }
 }
 
@@ -201,19 +204,6 @@ fn abbreviated_json(value: &Value, limit: usize) -> String {
 pub fn looks_like_tool_batch(reply: &str) -> bool {
     let region = extract_json_region(reply);
     region.contains("\"action\"") || region.contains("\"actions\"")
-}
-
-/// truncate_bytes clamps s to at most max bytes, backing up to the nearest
-/// char boundary so the result stays valid UTF-8.
-pub fn truncate_bytes(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 #[cfg(test)]
@@ -279,13 +269,5 @@ mod tests {
             value["max_completion_tokens"].as_u64(),
             Some(MAX_COMPLETION_TOKENS as u64)
         );
-    }
-
-    #[test]
-    fn truncate_bytes_respects_char_boundaries() {
-        assert_eq!(truncate_bytes("hello", 100), "hello");
-        assert_eq!(truncate_bytes("hello", 3), "hel");
-        // "é" is two bytes; a 2-byte clamp of "aé" must drop it, not split it.
-        assert_eq!(truncate_bytes("aé", 2), "a");
     }
 }

@@ -31,29 +31,14 @@ struct SyscallEnvelope<'a> {
     args: Option<&'a Value>,
 }
 
-/// The host-to-guest envelope, mirroring capcompute's `sys.SyscallResult`.
-/// Every field but `status` is omitted when empty, so all of them default.
-#[derive(Deserialize, Default)]
-struct ResponseEnvelope {
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    code: String,
-    #[serde(default)]
-    result: Option<Value>,
-    #[serde(default)]
-    message: String,
-}
-
 #[link(wasm_import_module = "extism:host/compute")]
 extern "C" {
     fn syscall(offset: u64) -> u64;
 }
 
-/// Syscall ABI this SDK speaks (sys.ABIVersion in capcompute); the host
-/// rejects mismatches with code "bad_abi". Since v4 the envelope is JSON, so
-/// args and results nest directly inside it — v3's protobuf envelope needed a
-/// hand-rolled codec on each side of the boundary to carry the same fields.
+/// Syscall ABI this SDK speaks (sys.ABIVersion in capcompute). The host rejects
+/// a mismatch with code "bad_abi". The envelope is JSON, so args and results
+/// nest directly inside it.
 pub const ABI_VERSION: u32 = 4;
 
 /// Reserved savepoint markers (sys.SyscallBegin/sys.SyscallCommit in
@@ -76,14 +61,12 @@ pub const SYS_LOG: &str = "sys.log";
 pub const SYS_ABORT: &str = "sys.abort";
 
 /// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
-/// recoverable observations the program can react to; "yield" never reaches the
-/// caller as a response (it surfaces as [`YieldedError`]), and "unspecified"
-/// covers a status the host left unset. These are the status strings the
-/// envelope carries verbatim (capcompute's sys.SyscallStatus).
+/// recoverable observations the program can react to. "yield" never reaches the
+/// caller as a response: it surfaces as [`YieldedError`]. These are the status
+/// strings the envelope carries verbatim (capcompute's sys.SyscallStatus).
 pub const STATUS_RESULT: &str = "result";
 pub const STATUS_YIELD: &str = "yield";
 pub const STATUS_FAILED: &str = "failed";
-pub const STATUS_UNSPECIFIED: &str = "unspecified";
 
 /// YieldedError is the yield sentinel: the host parked this run on external
 /// work (an approval, a timer, a message). Bubble it up and return
@@ -111,9 +94,12 @@ pub struct Call {
     pub args: Option<Value>,
 }
 
-/// HostResponse is the program's view of a syscall outcome with the JSON result
-/// payload already parsed. Status is "result" or "failed" — a yield never
-/// reaches the caller as a response (see [`YieldedError`]).
+/// HostResponse is a syscall outcome: the host-to-guest envelope, mirroring
+/// capcompute's `sys.SyscallResult`, with the JSON result already parsed. Status
+/// is "result" or "failed" — a yield never reaches the caller as a response
+/// (see [`YieldedError`]). Every field but `status` is omitted when empty.
+#[derive(Deserialize, Default)]
+#[serde(default)]
 pub struct HostResponse {
     pub status: String,
     pub code: String,
@@ -141,23 +127,12 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
     // on every syscall — the mirror of the request `mem.free()` above.
     let response_bytes = response_mem.to_vec();
     response_mem.free();
-    let decoded: ResponseEnvelope = serde_json::from_slice(&response_bytes)
+    let response: HostResponse = serde_json::from_slice(&response_bytes)
         .map_err(|e| anyhow::anyhow!("decode host response: {}", e))?;
-
-    let response = HostResponse {
-        status: if decoded.status.is_empty() {
-            STATUS_UNSPECIFIED.to_string()
-        } else {
-            decoded.status
-        },
-        code: decoded.code,
-        result: decoded.result,
-        message: decoded.message,
-    };
     match response.status.as_str() {
         STATUS_RESULT | STATUS_FAILED => Ok(response),
         STATUS_YIELD => Err(YieldedError.into()),
-        other => Err(anyhow::anyhow!("unsupported host outcome: {}", other)),
+        other => Err(anyhow::anyhow!("unsupported host outcome: {:?}", other)),
     }
 }
 
