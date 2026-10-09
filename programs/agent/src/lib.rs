@@ -577,9 +577,12 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
 
 // observe_result builds the observation of a successful tool call. A saved
 // result is shown only as its key and its size: the model reads it through
-// core.scratch, or summarizes it. Scratch's own results are not saved, because
-// they are how the model reads: they come back whole. An unsaved result comes
-// back whole up to INLINE_LIMIT, else as its size and head.
+// core.scratch, or summarizes it. Two kinds of result are not saved and come
+// back whole: scratch's own, because they are how the model reads, and the
+// runtime's sys.* calls (a timer, a declassify), whose results are small and
+// fixed. An unsaved result comes back whole up to INLINE_LIMIT, else as its
+// size and head. The LLM's replies never pass through here: they are the
+// conversation itself.
 fn observe_result(
     action: &str,
     args: &Value,
@@ -588,7 +591,9 @@ fn observe_result(
 ) -> anyhow::Result<ToolObservation> {
     let text = result.as_ref().map(Value::to_string).unwrap_or_default();
     let key = match &result {
-        Some(value) if saves && action != "core.scratch" => save_result(value)?,
+        Some(value) if saves && action != "core.scratch" && !action.starts_with("sys.") => {
+            save_result(value)?
+        }
         _ => None,
     };
     let content = match key {
@@ -858,7 +863,7 @@ fn build_system_prompt(
         r#"{"actions":[{"action":"<exact tool name>","content":<input matching that tool's schema>}]}"#,
     );
     if saves {
-        prompt.push_str("\n\nEvery successful tool result, except core.scratch's own, is saved in this session's scratch memory. In place of the result, its observation gives {\"key\", \"bytes_length\"}. A saved result never changes, and it stays available in later messages of this session. Read a result with core.scratch: get returns it whole, and search finds lines in it.");
+        prompt.push_str("\n\nEvery successful tool result, except those of core.scratch and the sys.* calls, is saved in this session's scratch memory. In place of the result, its observation gives {\"key\", \"bytes_length\"}. A saved result never changes, and it stays available in later messages of this session. Read a result with core.scratch: get returns it whole, and search finds lines in it.");
     }
     if summarizes {
         prompt.push_str(" To get an overview of a saved result without reading it here, use the summarize action. It summarizes the result in a separate conversation and returns only the summary:\n");

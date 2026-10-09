@@ -11,8 +11,8 @@ text, and transcript compaction. Compaction summarizes only the run's own turns:
 the system prompt, the session history and the run's input stay word for word.
 
 When the manifest grants `core.scratch` with `store`, the agent saves every
-successful tool result, except the results of `core.scratch` itself, in the
-session's scratch memory, under a key made from the result's content
+successful tool result, except the results of `core.scratch` and the runtime's
+`sys.*` calls, in the session's scratch memory, under a key made from the result's content
 (`io/<hash>`). A saved result never changes. In place of each result, the model
 gets only `{key, bytes_length}`, and it reads the result with `core.scratch`. With `get` also granted,
 the model can call the `summarize` action. The agent then summarizes the saved
