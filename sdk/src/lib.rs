@@ -7,8 +7,8 @@
 //! On top of that it owns the typed plumbing a program would otherwise
 //! re-implement by hand: [`input`]/[`output`] for the process's payloads, [`log`]
 //! for progress, the decoded [`Capability`] menu the host grants, and [`llm`] —
-//! the chat call and the model-reply decoding conversational programs share.
-//! What is left for the program is cognition.
+//! the chat call and the model-reply decoding. What is left for the program is
+//! cognition.
 //!
 //! A program is one cdylib crate under `programs/<name>/` that depends on this
 //! SDK and exports its entrypoint with `#[plugin_fn]`. It ships with an
@@ -76,13 +76,6 @@ pub const SYS_LOG: &str = "sys.log";
 /// re-runs it from there, or stops. Nothing is undone — the section re-executes.
 pub const SYS_ABORT: &str = "sys.abort";
 
-/// Reserved names for the journaled world sources: the processor pins the guest's
-/// ambient clock and RNG for determinism, so real time ([`now`]) and entropy
-/// ([`random`]) are syscalls — produced host-side on first execution, journaled,
-/// and replayed verbatim on resume.
-pub const SYS_NOW: &str = "sys.now";
-pub const SYS_RANDOM: &str = "sys.random";
-
 /// Status of a [`HostResponse`]. The host reports "result" or "failed" — both
 /// recoverable observations the program can react to; "yield" never reaches the
 /// caller as a response (it surfaces as [`YieldedError`]), and "unspecified"
@@ -123,7 +116,6 @@ pub struct Call {
 /// payload already parsed. Status is "result" or "failed" — a yield never
 /// reaches the caller as a response (see [`YieldedError`]).
 pub struct HostResponse {
-    pub abi: u32,
     pub status: String,
     pub code: String,
     pub result: Option<Value>,
@@ -154,10 +146,6 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
         .map_err(|e| anyhow::anyhow!("decode host response: {}", e))?;
 
     let response = HostResponse {
-        // The host omits its own version from the response; a mismatch would
-        // already have come back as a "bad_abi" failure, so a decoded response
-        // is by construction from a host speaking this ABI.
-        abi: ABI_VERSION,
         status: if decoded.status.is_empty() {
             STATUS_UNSPECIFIED.to_string()
         } else {
@@ -270,50 +258,6 @@ pub fn abort(reason: &str) -> anyhow::Result<()> {
         args: Some(args),
     })?;
     Ok(())
-}
-
-/// now reads the host's wall clock in unix milliseconds. The value is journaled
-/// on first execution and replayed verbatim on resume, so it is safe anywhere in
-/// deterministic guest code — unlike an ambient clock, which the processor pins.
-pub fn now() -> anyhow::Result<i64> {
-    let response = dispatch(&Call {
-        name: SYS_NOW.into(),
-        args: None,
-    })?;
-    if response.status != STATUS_RESULT {
-        anyhow::bail!("sys.now: {}", response.message);
-    }
-    response
-        .result
-        .as_ref()
-        .and_then(|v| v.get("unix_ms"))
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("sys.now: malformed payload"))
-}
-
-/// random draws `n` random bytes (1..=64). Journaled and replayed verbatim,
-/// like [`now`] — the deterministic source of jitter for guest-side backoff.
-pub fn random(n: usize) -> anyhow::Result<Vec<u8>> {
-    let response = dispatch(&Call {
-        name: SYS_RANDOM.into(),
-        args: Some(serde_json::json!({ "bytes": n })),
-    })?;
-    if response.status != STATUS_RESULT {
-        anyhow::bail!("sys.random: {}", response.message);
-    }
-    let hex = response
-        .result
-        .as_ref()
-        .and_then(|v| v.get("hex"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("sys.random: malformed payload"))?;
-    if hex.len() % 2 != 0 {
-        anyhow::bail!("sys.random: odd hex payload");
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(Into::into))
-        .collect()
 }
 
 /// log emits a human-readable progress line with the sys.log syscall. Logging is

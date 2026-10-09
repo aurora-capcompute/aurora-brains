@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["sdk", "programs/agent", "programs/echo"]
+members = ["sdk", "programs/agent"]
 
-# Every program is one crate under programs/<name>/, compiled to wasm32-wasip1
-# as a cdylib. New program: copy programs/echo/Cargo.toml, depend on the sdk,
-# write src/lib.rs and interface.json, add the member here.
+# The agent is a crate under programs/agent/, compiled to wasm32-wasip1 as a
+# cdylib over the sdk.
 
 [workspace.package]
 version = "0.2.0"

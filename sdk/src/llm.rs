@@ -1,6 +1,6 @@
-//! The LLM plumbing every conversational program shares: one chat call to the
-//! core.openaiApi capability, and the decoding of a model reply into the
-//! actions it asks for — `{"actions":[{"action":...,"content":...,"hard":...}]}`.
+//! The LLM plumbing: one chat call to the core.openaiApi capability, and the
+//! decoding of a model reply into the actions it asks for —
+//! `{"actions":[{"action":...,"content":...,"hard":...}]}`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
