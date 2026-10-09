@@ -6,8 +6,16 @@ module (`wasm32-wasip1`) and runs as a process inside the
 repo keeps its old name. Its contents are the agent, not blockchain code.)
 
 The agent is a tool-calling LLM loop over whatever its manifest grants. It
-handles several actions per turn, a savepoint per turn, web pages reduced to
-text, and transcript compaction. Compaction summarizes only the run's own turns:
+handles several actions per turn, web pages reduced to text, and transcript
+compaction.
+
+Each LLM call runs in its own section (`sys.begin` … `sys.commit`). An LLM call
+has no effects, so it is safe to run again: when it fails, the process fails
+with the section open, and a resume calls the LLM again. The model can open its
+own sections with `sys.begin` and `sys.commit` around steps that are safe to
+run again, and `sys.abort` sends the run back to the start of the outermost
+open section. With no section open, `sys.abort` fails the process. A tool call
+the agent cannot run goes back to the model as a failed observation. Compaction summarizes only the run's own turns:
 the system prompt, the session history and the run's input stay word for word.
 
 When the manifest grants `core.scratch` with `store`, the agent saves every
@@ -36,8 +44,6 @@ connector runs it.
 
 - `dispatch`: call a granted capability. A failure comes back as a response
   that the agent can act on.
-- `dispatch_hard`: the same call inside its own savepoint. A failure fails the
-  process, and a retry runs the call again.
 - `input`, `output`, `log`: read the input, record the answer, report progress.
 - `savepoint()` / `commit()`: bracket a section. `abort(reason)` runs the open
   section again from its `savepoint()`. With no open section, the process

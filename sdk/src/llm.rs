@@ -1,6 +1,6 @@
 //! The LLM plumbing: one chat call to the core.openaiApi capability, and the
 //! decoding of a model reply into the actions it asks for —
-//! `{"actions":[{"action":...,"content":...,"hard":...}]}`.
+//! `{"actions":[{"action":...,"content":...}]}`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,10 +80,6 @@ pub fn chat(messages: &[Message]) -> anyhow::Result<String> {
 pub struct ModelEnvelope {
     pub action: String,
     pub content: Value,
-    /// `hard` marks a call whose failure must abort the process (with its
-    /// savepoint left open) so a later resume re-executes it, instead of being
-    /// reported back as a recoverable observation. Default is the soft path.
-    pub hard: bool,
 }
 
 /// decode_model_envelopes reads the actions out of a model reply.
@@ -181,11 +177,9 @@ fn decode_model_envelope_object(value: Value) -> anyhow::Result<Vec<ModelEnvelop
             )
         })?;
     let content = value.get("content").cloned().unwrap_or(Value::Null);
-    let hard = value.get("hard").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(vec![ModelEnvelope {
         action: action.to_string(),
         content,
-        hard,
     }])
 }
 
@@ -237,14 +231,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_accepts_an_actions_batch_with_hard_flag() {
-        let reply = r#"{"actions":[{"action":"db.write","content":{"k":"v"},"hard":true},{"action":"final","content":{"answer":"$1"}}]}"#;
+    fn decode_accepts_an_actions_batch() {
+        let reply = r#"{"actions":[{"action":"db.write","content":{"k":"v"}},{"action":"final","content":{"answer":"$1"}}]}"#;
         let envelopes = decode_model_envelopes(reply).unwrap();
         assert_eq!(envelopes.len(), 2);
         assert_eq!(envelopes[0].action, "db.write");
-        assert!(envelopes[0].hard);
+        assert_eq!(envelopes[0].content, json!({"k": "v"}));
         assert_eq!(envelopes[1].action, "final");
-        assert!(!envelopes[1].hard);
     }
 
     #[test]

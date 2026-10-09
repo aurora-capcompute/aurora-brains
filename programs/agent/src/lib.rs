@@ -15,12 +15,16 @@ const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm gue
 The host owns all side effects. Reply with exactly one compact JSON object containing an \"actions\" array.\n\
 Use only the tools listed below. Match each tool's input JSON schema exactly.\n\
 You may request multiple independent tool calls in one turn. The host executes them sequentially and returns one aggregated observation array.\n\
-Each observation has status \"result\" with content or status \"failed\" with an error. A failed tool call is recoverable by default: use other sources, retry when appropriate, or explain the limitation.\n\
-Add \"hard\": true to a tool call only when its failure must abort the process so a later resume re-executes it (for example, a state-changing step the process cannot meaningfully continue without). Omit \"hard\" for all normal, recoverable calls.\n\
+Each observation has status \"result\" with content or status \"failed\" with an error. A failed tool call is recoverable: use other sources, retry when appropriate, or explain the limitation.\n\
+Sections: {\"action\":\"sys.begin\",\"content\":{}} opens a section and {\"action\":\"sys.commit\",\"content\":{}} closes it. Open a section only around steps that are safe to run again. Sections nest.\n\
 After receiving observations, either request more tools or return exactly one terminal action:\n\
 {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\",\"reason\":\"...\"}}]} to finish, or\n\
-{\"actions\":[{\"action\":\"abort\",\"content\":{\"reason\":\"...\"}}]} to give up: the process stops as failed with that reason, and nothing it already did is undone.\n\
+{\"actions\":[{\"action\":\"sys.abort\",\"content\":{\"reason\":\"...\"}}]} to abandon. With a section open, the run goes back to the start of the outermost open section and you decide again from there, at most 10 times. With no section open, the process stops as failed with that reason. Nothing that already ran is undone.\n\
 Never combine a terminal action with tool calls in the same actions array.";
+
+// The section calls the model may make directly. The runtime serves them for
+// every program, so they are not on the tool menu.
+const SECTION_CALLS: [&str; 2] = ["sys.begin", "sys.commit"];
 
 // Context-management bounds. The transcript's serialized byte length is a cheap
 // proxy for tokens (~4 bytes/token); tune these to the model's real window.
@@ -131,7 +135,7 @@ fn run_agent() -> anyhow::Result<()> {
     let mut system_prompt = build_system_prompt(&inp.capabilities, saves, summarizes)?;
     if inp.attempt > 1 {
         system_prompt.push_str(&format!(
-            "\nThis is attempt {} of this task; earlier attempts were rolled back.",
+            "\nThis is attempt {} of this task. Earlier attempts ran and were abandoned. Their steps were not undone.",
             inp.attempt
         ));
     }
@@ -172,14 +176,6 @@ fn run_agent() -> anyhow::Result<()> {
     let mut step: u32 = 0;
     loop {
         step += 1;
-        // Each agentic turn — one LLM call plus the tool calls it requests —
-        // is a savepoint: sys.begin here, sys.commit at the turn's end. If the
-        // turn breaks mid-way (a malformed model reply, an unavailable
-        // capability), the savepoint is left open and a
-        // resumed run forks right after it, re-executing the WHOLE turn live —
-        // including the LLM call, giving the model a fresh chance — instead of
-        // deterministically replaying the broken completion forever.
-        let turn = sdk::savepoint()?;
 
         // Keep the transcript within the model's window: once it crosses
         // COMPACT_THRESHOLD, summarize the oldest of the run's own turns (never
@@ -192,7 +188,7 @@ fn run_agent() -> anyhow::Result<()> {
         // the hard ceiling even after compaction — demand a final answer this
         // turn instead of looping (or blowing the context) further.
         if step >= MAX_STEPS || messages_bytes(&messages) >= HARD_CEILING {
-            return finalize(turn, &mut messages);
+            return finalize(&mut messages);
         }
 
         let chat = chat_within_budget(&mut messages)?;
@@ -200,38 +196,38 @@ fn run_agent() -> anyhow::Result<()> {
             Ok(envelopes) => envelopes,
             // The reply didn't parse as an action envelope. A prose answer, or a
             // truncated final carrying a recoverable "answer", is still the answer:
-            // end the run with it via wrap_up rather than failing the process —
-            // this turn's LLM call is journaled, so a resume replays the salvage.
+            // end the run with it via wrap_up rather than failing the process.
             // But a botched/truncated TOOL batch (looks like a batch, no
             // recoverable answer) must NOT be salvaged: publishing its raw
-            // {"actions":...} text would leak protocol as the answer. Leave the
-            // savepoint open and fail so the turn re-drives and the model retries.
+            // {"actions":...} text would leak protocol as the answer. The model
+            // gets the parse error back and replies again.
             Err(e) => {
                 if looks_like_tool_batch(&chat) && recover_answer_field(&chat).is_none() {
-                    return Err(e);
+                    messages.push(Message {
+                        role: "assistant".into(),
+                        content: chat,
+                    });
+                    messages.push(Message {
+                        role: "user".into(),
+                        content: format!("Your reply did not parse as an actions batch ({e}). Reply again with exactly one valid JSON object."),
+                    });
+                    continue;
                 }
-                turn.commit()?;
                 return wrap_up(&chat);
             }
         };
 
         let has_tool = envelopes
             .iter()
-            .any(|e| e.action != "final" && e.action != "abort");
-        let first_final_idx = envelopes.iter().position(|e| e.action == "final");
-        let first_abort_idx = envelopes.iter().position(|e| e.action == "abort");
-
+            .any(|e| e.action != "final" && e.action != "sys.abort");
         if !has_tool {
-            if let Some(idx) = first_abort_idx {
-                // The model gave up. Commit the turn first so no section is left
-                // open: with nothing to re-run, the host stops the process as
-                // failed with the model's reason.
-                turn.commit()?;
-                return sdk::abort(&abort_reason(&envelopes[idx]));
+            // The model abandons the open section, or gives up. The runtime
+            // reads the abort off the journal's tail, so nothing may follow it.
+            if let Some(envelope) = envelopes.iter().find(|e| e.action == "sys.abort") {
+                return sdk::abort(&abort_reason(envelope));
             }
-            if let Some(idx) = first_final_idx {
-                turn.commit()?;
-                return output_final(&envelopes[idx]);
+            if let Some(envelope) = envelopes.iter().find(|e| e.action == "final") {
+                return output_final(envelope);
             }
         }
 
@@ -240,53 +236,41 @@ fn run_agent() -> anyhow::Result<()> {
             content: chat,
         });
 
+        // A request the agent cannot run goes back to the model as a failed
+        // observation, so the model can correct itself in its next turn.
         let mut observations: Vec<ToolObservation> = Vec::with_capacity(envelopes.len());
-        for (i, envelope) in envelopes.iter().enumerate() {
-            if envelope.action == "final" {
+        for envelope in &envelopes {
+            let action = envelope.action.as_str();
+            let obs = if action == "final" {
                 continue;
-            }
-            if envelope.action == "summarize" && summarizes {
-                emit_progress(&envelope.action);
-                observations.push(summarize_saved(&envelope.content, &task)?);
-                continue;
-            }
-            if !allowed.contains(envelope.action.as_str()) {
-                anyhow::bail!(
-                    "action {} requested unavailable capability {:?}",
-                    i,
-                    envelope.action
-                );
-            }
-            if envelope.content.is_null() {
-                anyhow::bail!("capability action {} missing content", i);
-            }
-            emit_progress(&envelope.action);
-            let tool_call = Call {
-                name: envelope.action.clone(),
-                args: Some(envelope.content.clone()),
-            };
-            let mut response = if envelope.hard {
-                sdk::dispatch_hard(&tool_call)?
+            } else if action == "summarize" && summarizes {
+                emit_progress(action);
+                summarize_saved(&envelope.content, &task)?
+            } else if action == "sys.abort" {
+                failed_observation(envelope, "sys.abort must be the only action of its reply")
+            } else if !allowed.contains(action) && !SECTION_CALLS.contains(&action) {
+                failed_observation(
+                    envelope,
+                    format!(
+                        "unknown tool {action:?}: use only the tools listed in the system prompt"
+                    ),
+                )
             } else {
-                sdk::dispatch(&tool_call)?
-            };
-            // A fetched web page comes back as raw HTML; strip it to readable
-            // text before it is saved or shown. Guarded to GET responses whose
-            // content-type is text/html, so JSON API responses are left
-            // byte-for-byte intact.
-            if response.status == sdk::STATUS_RESULT {
-                strip_internet_html(&envelope.action, &envelope.content, &mut response.result);
-            }
-            let obs = if response.status == sdk::STATUS_FAILED {
-                ToolObservation {
-                    action: envelope.action.clone(),
-                    status: sdk::STATUS_FAILED.into(),
-                    args: Some(envelope.content.clone()),
-                    content: None,
-                    error: Some(response.message),
+                emit_progress(action);
+                let mut response = sdk::dispatch(&Call {
+                    name: envelope.action.clone(),
+                    args: (!envelope.content.is_null()).then(|| envelope.content.clone()),
+                })?;
+                if response.status == sdk::STATUS_FAILED {
+                    failed_observation(envelope, response.message)
+                } else {
+                    // A fetched web page comes back as raw HTML; strip it to
+                    // readable text before it is saved or shown. Guarded to GET
+                    // responses whose content-type is text/html, so JSON API
+                    // responses are left byte-for-byte intact.
+                    strip_internet_html(action, &envelope.content, &mut response.result);
+                    observe_result(action, &envelope.content, response.result, saves)?
                 }
-            } else {
-                observe_result(&envelope.action, &envelope.content, response.result, saves)?
             };
             observations.push(obs);
         }
@@ -302,7 +286,37 @@ fn run_agent() -> anyhow::Result<()> {
             role: "user".into(),
             content: raw_obs,
         });
-        turn.commit()?;
+    }
+}
+
+// failed_observation reports a model request that did not succeed.
+fn failed_observation(envelope: &ModelEnvelope, error: impl Into<String>) -> ToolObservation {
+    ToolObservation {
+        action: envelope.action.clone(),
+        status: sdk::STATUS_FAILED.into(),
+        args: Some(envelope.content.clone()),
+        content: None,
+        error: Some(error.into()),
+    }
+}
+
+// chat_in_section makes one LLM call inside its own section. An LLM call has no
+// effects, so it is safe to run again: when it fails, the section stays open
+// and the process fails, and a resume forks at the outermost open section to
+// call the LLM again. A size error is the exception: the caller sheds bytes and
+// calls again, so the section is closed first.
+fn chat_in_section(messages: &[Message]) -> anyhow::Result<String> {
+    let section = sdk::savepoint()?;
+    match llm::chat(messages) {
+        Ok(reply) => {
+            section.commit()?;
+            Ok(reply)
+        }
+        Err(e) if is_size_error(&e.to_string()) => {
+            section.commit()?;
+            Err(e)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -315,7 +329,7 @@ fn run_agent() -> anyhow::Result<()> {
 // (e.g. an approval) is not a size error and propagates unchanged.
 fn chat_within_budget(messages: &mut [Message]) -> anyhow::Result<String> {
     loop {
-        match llm::chat(messages) {
+        match chat_in_section(messages) {
             Ok(chat) => return Ok(chat),
             Err(e) => {
                 if !is_size_error(&e.to_string()) || !shrink_messages(messages) {
@@ -412,20 +426,19 @@ fn summarize(excerpt: &str) -> anyhow::Result<String> {
             content: format!("Compress these earlier steps:\n\n{}", excerpt),
         },
     ];
-    llm::chat(&msgs)
+    chat_in_section(&msgs)
 }
 
-// finalize forces the run to a close: it commits the current turn after asking
-// the model for exactly one final action. If the model complies, that answer is
-// published; if it still refuses (returns tools, or unparseable), its best text
-// is salvaged so the run always terminates with an answer.
-fn finalize(turn: sdk::Savepoint, messages: &mut Vec<Message>) -> anyhow::Result<()> {
+// finalize forces the run to a close by asking the model for exactly one final
+// action. If the model complies, that answer is published; if it still refuses
+// (returns tools, or unparseable), its best text is salvaged so the run always
+// terminates with an answer.
+fn finalize(messages: &mut Vec<Message>) -> anyhow::Result<()> {
     messages.push(Message {
         role: "user".into(),
         content: FINAL_DIRECTIVE.into(),
     });
     let chat = chat_within_budget(messages)?;
-    turn.commit()?;
     wrap_up(&chat)
 }
 
@@ -440,7 +453,7 @@ fn wrap_up(chat: &str) -> anyhow::Result<()> {
         if let Some(idx) = envelopes.iter().position(|e| e.action == "final") {
             return output_final(&envelopes[idx]);
         }
-        if let Some(idx) = envelopes.iter().position(|e| e.action == "abort") {
+        if let Some(idx) = envelopes.iter().position(|e| e.action == "sys.abort") {
             return sdk::abort(&abort_reason(&envelopes[idx]));
         }
     }
@@ -689,11 +702,9 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
             ),
         },
     ];
-    let summary = match chat_within_budget(&mut msgs) {
-        Ok(summary) => summary,
-        Err(e) if sdk::yielded(&e) => return Err(e),
-        Err(e) => return Ok(failed(e.to_string())),
-    };
+    // An LLM failure fails the process, as in the main chat: its section stays
+    // open, so a resume calls the LLM again.
+    let summary = chat_within_budget(&mut msgs)?;
     let mut out = serde_json::json!({ "key": key, "summary": summary });
     if covered.len() < text.len() {
         out["note"] = Value::String(format!(

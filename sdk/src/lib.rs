@@ -1,8 +1,8 @@
 //! The Aurora program SDK: everything a guest program needs to speak the
 //! syscall boundary, so a program crate contains only cognition. It owns the
 //! ABI v4 JSON envelope, the single `extism:host/compute` syscall import, and
-//! the dispatch protocol — result/failed observations, the yield sentinel,
-//! [`savepoint`]s, and savepoint-bracketed "hard" calls ([`dispatch_hard`]).
+//! the dispatch protocol — result/failed observations, the yield sentinel, and
+//! [`savepoint`]s.
 //!
 //! On top of that it owns the typed plumbing a program would otherwise
 //! re-implement by hand: [`input`]/[`output`] for the process's payloads, [`log`]
@@ -59,8 +59,7 @@ pub const ABI_VERSION: u32 = 4;
 /// Reserved savepoint markers (sys.SyscallBegin/sys.SyscallCommit in
 /// capcompute). They carry no side effect; the host journals them and uses an
 /// open sys.begin (one with no matching sys.commit) as the fork point when a
-/// failed run is resumed. Brackets have stack semantics. [`dispatch_hard`]
-/// wraps one call in them.
+/// failed run is resumed. Brackets have stack semantics.
 pub const SYS_BEGIN: &str = "sys.begin";
 pub const SYS_COMMIT: &str = "sys.commit";
 
@@ -162,16 +161,15 @@ pub fn dispatch(c: &Call) -> anyhow::Result<HostResponse> {
     }
 }
 
-/// A Savepoint brackets a critical zone in a sys.begin/sys.commit pair. Open one
-/// with [`savepoint`] and close it with [`Savepoint::commit`] once the zone has
-/// succeeded; *dropping it without committing* leaves the sys.begin open. A run
-/// that then fails is first re-driven by replay — a transient failure simply
-/// resumes and continues. A failure that re-drives without progress aborts the
-/// zone: the journal forks at the begin and the whole zone re-executes live.
-/// That drop-aborts behavior is the point — propagate an error out of the zone
-/// (with `?`) and the savepoint unwinds the run for you. Brackets have stack
-/// semantics; [`dispatch_hard`] wraps a single call this way.
-#[must_use = "a Savepoint aborts the process unless it is committed"]
+/// A Savepoint brackets a zone that is safe to run again in a sys.begin/
+/// sys.commit pair. Open one with [`savepoint`] and close it with
+/// [`Savepoint::commit`] once the zone has succeeded; *dropping it without
+/// committing* leaves the sys.begin open. A run that then fails is re-driven
+/// once by replay, and a transient failure simply continues. A failure at the
+/// same point again fails the process, and a resume forks at the outermost open
+/// begin, so the whole zone runs again live. [`abort`] inside an open zone forks
+/// there at once. Brackets have stack semantics.
+#[must_use = "a Savepoint stays open unless it is committed"]
 #[non_exhaustive]
 pub struct Savepoint {}
 
@@ -195,23 +193,6 @@ pub fn savepoint() -> anyhow::Result<Savepoint> {
         args: None,
     })?;
     Ok(Savepoint {})
-}
-
-/// dispatch_hard brackets a single call in a [`savepoint`]. On success it commits
-/// and returns the result. On failure it leaves the begin open and returns an
-/// error that fails the process — a transient failure re-drives and re-executes
-/// the call; a deterministic one aborts the section, and a retry forks right at
-/// the begin, re-executing under a new revision. A plain [`dispatch`] (the
-/// default, "soft") instead
-/// records the failure for replay and lets the program react to it.
-pub fn dispatch_hard(c: &Call) -> anyhow::Result<HostResponse> {
-    let sp = savepoint()?;
-    let response = dispatch(c)?;
-    if response.status == STATUS_FAILED {
-        anyhow::bail!("hard capability {:?} failed: {}", c.name, response.message);
-    }
-    sp.commit()?;
-    Ok(response)
 }
 
 /// input fetches this run's input payload with the sys.input syscall and
