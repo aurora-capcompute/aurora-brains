@@ -5,9 +5,10 @@ module (`wasm32-wasip1`) and runs as a process inside the
 [capcompute](https://github.com/aurora-capcompute/capcompute) processor. (The
 repo keeps its old name. Its contents are the agent, not blockchain code.)
 
-The agent is a tool-calling LLM loop over whatever its manifest grants. It
-handles several actions per turn, web pages reduced to text, and transcript
-compaction.
+The agent is a tool-calling LLM loop over whatever its manifest grants. Its
+system prompt lists the granted tools, then the operator's skills (name,
+description, instructions) from `sys.input`. It handles several actions per
+turn, web pages reduced to text, and transcript compaction.
 
 Each LLM call runs in its own section (`sys.begin` … `sys.commit`). An LLM call
 has no effects, so it is safe to run again: when it fails, the process fails

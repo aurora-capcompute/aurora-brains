@@ -251,3 +251,13 @@ pub struct Capability {
     #[serde(default)]
     pub hidden: bool,
 }
+
+/// Skill is one operator skill from `sys.input`. It grants nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Skill {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub instructions: String,
+}

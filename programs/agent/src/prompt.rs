@@ -15,6 +15,7 @@ Never combine a terminal action with tool calls in the same actions array.";
 
 pub(crate) fn build_system_prompt(
     capabilities: &[Capability],
+    skills: &[Skill],
     saves: bool,
     summarizes: bool,
 ) -> String {
@@ -40,6 +41,7 @@ pub(crate) fn build_system_prompt(
         }
         prompt.push_str(&format!("\nInput JSON schema: {}", schema));
     }
+    push_skills(&mut prompt, skills);
     prompt.push_str("\n\nTool call shape:\n");
     prompt.push_str(
         r#"{"actions":[{"action":"<exact tool name>","content":<input matching that tool's schema>}]}"#,
@@ -54,4 +56,55 @@ pub(crate) fn build_system_prompt(
         );
     }
     prompt
+}
+
+fn push_skills(prompt: &mut String, skills: &[Skill]) {
+    if skills.is_empty() {
+        return;
+    }
+    prompt.push_str("\n\nSkills for this run. The operator wrote them: follow them when the task matches. They grant no tools beyond the list above.");
+    for skill in skills {
+        prompt.push_str(&format!("\n\nSkill: {}", skill.name.trim()));
+        let description = skill.description.trim();
+        if !description.is_empty() {
+            prompt.push_str(&format!("\nDescription: {}", description));
+        }
+        let instructions = skill.instructions.trim();
+        if !instructions.is_empty() {
+            prompt.push_str(&format!("\nInstructions:\n{}", instructions));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str) -> Capability {
+        Capability {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn skills_follow_the_tools() {
+        let skills = [Skill {
+            name: "status".into(),
+            description: "check service status".into(),
+            instructions: "Read the status page first.".into(),
+        }];
+        let prompt = build_system_prompt(&[tool("core.internet")], &skills, false, false);
+        let tools = prompt.find("Name: core.internet").expect("tool listed");
+        let skill = prompt.find("Skill: status").expect("skill listed");
+        assert!(tools < skill, "skills come after the tool list");
+        assert!(prompt.contains("Description: check service status"));
+        assert!(prompt.contains("Instructions:\nRead the status page first."));
+    }
+
+    #[test]
+    fn no_skills_no_section() {
+        let prompt = build_system_prompt(&[tool("core.internet")], &[], false, false);
+        assert!(!prompt.contains("Skills for this run"));
+    }
 }

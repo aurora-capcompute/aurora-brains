@@ -23,7 +23,7 @@ use aurora_program_sdk::llm::{
     self, decode_model_envelopes, extract_json_region, looks_like_tool_batch, Message,
     ModelEnvelope,
 };
-use aurora_program_sdk::{Call, Capability};
+use aurora_program_sdk::{Call, Capability, Skill};
 use chat::{chat_within_budget, finalize, maybe_compact, messages_bytes};
 use extism_pdk::*;
 use prompt::build_system_prompt;
@@ -62,6 +62,8 @@ struct Input {
     history: Vec<Message>,
     #[serde(default)]
     capabilities: Vec<Capability>,
+    #[serde(default)]
+    skills: Vec<Skill>,
     /// Which attempt this is (bumped by the host per retry) — lets the model
     /// know earlier attempts were rolled back and back off accordingly.
     #[serde(default)]
@@ -94,7 +96,12 @@ fn run_agent() -> anyhow::Result<()> {
     let inp: Input = sdk::input()?;
     let tools = Tools::new(&inp.capabilities, &inp.input);
 
-    let mut system_prompt = build_system_prompt(&inp.capabilities, tools.saves, tools.summarizes);
+    let mut system_prompt = build_system_prompt(
+        &inp.capabilities,
+        &inp.skills,
+        tools.saves,
+        tools.summarizes,
+    );
     if inp.attempt > 1 {
         system_prompt.push_str(&format!(
             "\nThis is attempt {} of this task. Earlier attempts ran and were abandoned. Their steps were not undone.",
