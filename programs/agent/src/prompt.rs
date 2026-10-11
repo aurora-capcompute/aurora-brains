@@ -2,16 +2,34 @@
 
 use super::*;
 
-const PROTOCOL_PROMPT: &str = "You are an Aurora agent running inside a Wasm guest.\n\
-The host owns all side effects. Reply with exactly one compact JSON object containing an \"actions\" array.\n\
-Use only the tools listed below. Match each tool's input JSON schema exactly.\n\
-You may request multiple independent tool calls in one turn. The host executes them sequentially and returns one aggregated observation array.\n\
-Each observation has status \"result\" with content or status \"failed\" with an error. A failed tool call is recoverable: use other sources, retry when appropriate, or explain the limitation.\n\
-Sections: {\"action\":\"sys.begin\",\"content\":{}} opens a section and {\"action\":\"sys.commit\",\"content\":{}} closes it. Open a section only around steps that are safe to run again. Sections nest.\n\
-After receiving observations, either request more tools or return exactly one terminal action:\n\
-{\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\"}}]} to finish, or\n\
-{\"actions\":[{\"action\":\"sys.abort\",\"content\":{\"reason\":\"...\"}}]} to abandon. With a section open, the run goes back to the start of the outermost open section and you decide again from there, at most 10 times. With no section open, the process stops as failed with that reason. Nothing that already ran is undone.\n\
-Never combine a terminal action with tool calls in the same actions array.";
+const PROTOCOL_PROMPT: &str = r#"You are an Aurora agent. You run inside a Wasm sandbox. Only the host can do something outside the sandbox. You act through tool calls.
+
+Reply format:
+- Reply with exactly one JSON object, with no text before or after it. Write the object on one line.
+- The object has one key, "actions". Its value is a list of actions.
+- Each action has two keys: "action" is the tool name, and "content" is the tool input.
+- Use only the tools in the list below. Each input must match the input schema of its tool exactly.
+
+Tool calls:
+- One reply can contain more than one tool call. The host runs the calls in order.
+- The host then returns a list with one observation for each call.
+- An observation has the status "result" and a "content", or the status "failed" and an "error".
+- A failed call does not stop the run. Use a different source, try the call again, or explain the problem.
+
+Sections:
+- {"action":"sys.begin","content":{}} opens a section. {"action":"sys.commit","content":{}} closes it.
+- Open a section only around steps that are safe to run again.
+- A section can be inside another section.
+
+End of the run:
+- To finish, reply with only a final action:
+  {"actions":[{"action":"final","content":{"answer":"..."}}]}
+- To abandon the work, reply with only an abort action:
+  {"actions":[{"action":"sys.abort","content":{"reason":"..."}}]}
+- If a section is open, an abort sends the run back to the sys.begin of the outermost open section. Then you decide again. This can occur at most 10 times.
+- If no section is open, an abort stops the process with the status "failed" and your reason.
+- An abort does not undo the steps that ran.
+- Do not put a final action or an abort action in a reply with tool calls."#;
 
 pub(crate) fn build_system_prompt(
     capabilities: &[Capability],
@@ -21,11 +39,11 @@ pub(crate) fn build_system_prompt(
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(PROTOCOL_PROMPT);
-    prompt.push_str("\n\nAvailable tools for this run:");
+    prompt.push_str("\n\nTools for this run:");
     // Hidden capabilities are dispatchable but kept off the discoverable menu.
     let visible: Vec<&Capability> = capabilities.iter().filter(|c| !c.hidden).collect();
     if visible.is_empty() {
-        prompt.push_str("\nNone. Return a final action without attempting a tool call.");
+        prompt.push_str("\nNone. Do not call a tool. Reply with a final action.");
         return prompt;
     }
     for (i, tool) in visible.iter().enumerate() {
@@ -42,18 +60,25 @@ pub(crate) fn build_system_prompt(
         prompt.push_str(&format!("\nInput JSON schema: {}", schema));
     }
     push_skills(&mut prompt, skills);
-    prompt.push_str("\n\nTool call shape:\n");
+    prompt.push_str("\n\nThe shape of a tool call:\n");
     prompt.push_str(
         r#"{"actions":[{"action":"<exact tool name>","content":<input matching that tool's schema>}]}"#,
     );
     if saves {
-        prompt.push_str("\n\nEvery successful tool result, except those of core.scratch and the sys.* calls, is saved in this session's scratch memory. In place of the result, its observation gives {\"key\", \"bytes_length\"}. A saved result never changes, and it stays available in later messages of this session. Read a result with core.scratch: get returns it whole, and search finds lines in it.");
+        prompt.push_str(concat!(
+            "\n\nSaved results:",
+            "\n- The host saves each successful tool result in the scratch memory of this session. It does not save results of core.scratch or of sys.* calls.",
+            "\n- For a saved result, the observation gives {\"key\", \"bytes_length\"} in place of the result.",
+            "\n- A saved result does not change. It stays available for the rest of this session.",
+            "\n- To read a saved result, use core.scratch. The operation \"get\" returns all of it. The operation \"search\" finds lines in it.",
+        ));
     }
     if summarizes {
-        prompt.push_str(" To get an overview of a saved result without reading it here, use the summarize action. It summarizes the result in a separate conversation and returns only the summary:\n");
-        prompt.push_str(
+        prompt.push_str(concat!(
+            "\n- To get a summary of a saved result, use the summarize action. The host makes the summary in a separate conversation. It returns only the summary to this conversation:",
+            "\n  ",
             r#"{"actions":[{"action":"summarize","content":{"key":"<key>","focus":"<what you need from it>"}}]}"#,
-        );
+        ));
     }
     prompt
 }
@@ -62,7 +87,7 @@ fn push_skills(prompt: &mut String, skills: &[Skill]) {
     if skills.is_empty() {
         return;
     }
-    prompt.push_str("\n\nSkills for this run. The operator wrote them: follow them when the task matches. They grant no tools beyond the list above.");
+    prompt.push_str("\n\nSkills for this run. The operator wrote these skills. When a skill matches the task, follow its instructions. A skill gives no tools in addition to the list above.");
     for skill in skills {
         prompt.push_str(&format!("\n\nSkill: {}", skill.name.trim()));
         let description = skill.description.trim();

@@ -61,12 +61,14 @@ impl Tools {
                     summarize_saved(&envelope.content, &self.task)?
                 }
                 "sys.abort" => {
-                    failed_observation(envelope, "sys.abort must be the only action of its reply")
+                    failed_observation(envelope, "sys.abort must be the only action in its reply")
                 }
                 _ if !self.allowed.contains(action) && !SECTION_CALLS.contains(&action) => {
                     failed_observation(
                         envelope,
-                        format!("unknown tool {action:?}: use only the tools listed in the system prompt"),
+                        format!(
+                            "unknown tool {action:?}. Use only the tools in the system prompt."
+                        ),
                     )
                 }
                 _ => {
@@ -116,7 +118,7 @@ pub(crate) struct ToolObservation {
 const INLINE_LIMIT: usize = 48 * 1024;
 const EXCERPT_BYTES: usize = 2 * 1024;
 
-const SAVED_SUMMARY_PROMPT: &str = "You summarize a saved tool result for an AI agent, toward a focus. Keep every fact, URL, identifier, number, quote, name and finding that serves the focus. Drop navigation, ads, boilerplate and repetition. Reply with prose only, with no JSON and no tool calls.";
+const SAVED_SUMMARY_PROMPT: &str = "You summarize a saved tool result for an AI agent. The agent gives a focus. Keep every fact, URL, identifier, number, quote, name and finding that serves the focus. Remove navigation, advertisements, boilerplate and repetition. Reply with prose only. Do not write JSON or tool calls.";
 
 // failed_observation reports a model request that did not succeed.
 fn failed_observation(envelope: &ModelEnvelope, error: impl Into<String>) -> ToolObservation {
@@ -188,7 +190,7 @@ fn observe_result(
         None => Some(serde_json::json!({
             "bytes_length": text.len(),
             "excerpt": head_excerpt(&text, EXCERPT_BYTES),
-            "note": "The excerpt is the head of the result. The result is not saved.",
+            "note": "The excerpt is the first part of the result. The host did not save the result.",
         })),
     };
     Ok(ToolObservation {
@@ -235,7 +237,7 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
     let failed = |error: String| observation(sdk::STATUS_FAILED, None, Some(error));
 
     let Some(key) = content.get("key").and_then(Value::as_str) else {
-        return Ok(failed("summarize needs the key of a saved value".into()));
+        return Ok(failed("summarize needs the key of a saved result".into()));
     };
     let focus = content
         .get("focus")
@@ -253,7 +255,11 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
         Some(Value::Object(mut found)) if found.get("found") == Some(&Value::Bool(true)) => {
             found.remove("value").unwrap_or(Value::Null)
         }
-        _ => return Ok(failed(format!("no value is saved under {key}"))),
+        _ => {
+            return Ok(failed(format!(
+                "the host has no saved result with the key {key}"
+            )))
+        }
     };
     let text = match value {
         Value::String(text) => text,
@@ -268,7 +274,7 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
         Message {
             role: "user".into(),
             content: format!(
-                "Focus:\n{}\n\nSaved value {}:\n\n{}",
+                "Focus:\n{}\n\nSaved result {}:\n\n{}",
                 &focus[..focus.floor_char_boundary(512)],
                 key,
                 covered
@@ -281,7 +287,7 @@ fn summarize_saved(content: &Value, task: &str) -> anyhow::Result<ToolObservatio
     let mut out = serde_json::json!({ "key": key, "summary": summary });
     if covered.len() < text.len() {
         out["note"] = Value::String(format!(
-            "The summary covers the first {} of {} bytes. Use core.scratch search on the key for the rest.",
+            "The summary covers only the first {} of {} bytes. To find something in the rest, use core.scratch search with the key.",
             covered.len(),
             text.len()
         ));
@@ -319,7 +325,7 @@ fn scratch_operations(capabilities: &[Capability]) -> Vec<String> {
 fn head_excerpt(s: &str, limit: usize) -> String {
     let head = &s[..s.floor_char_boundary(limit)];
     if head.len() < s.len() {
-        format!("{head}\n…[only the head is shown]")
+        format!("{head}\n…[This is only the first part of the result.]")
     } else {
         head.to_string()
     }
@@ -341,7 +347,7 @@ mod tests {
         assert_eq!(head_excerpt("short", 100), "short");
         let cut = head_excerpt("abcdefghij", 4);
         assert!(cut.starts_with("abcd"));
-        assert!(cut.contains("only the head"));
+        assert!(cut.contains("only the first part"));
     }
 
     // The granted scratch operations are read from the menu schema: a oneOf of

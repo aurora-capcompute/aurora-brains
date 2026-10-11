@@ -104,7 +104,7 @@ fn run_agent() -> anyhow::Result<()> {
     );
     if inp.attempt > 1 {
         system_prompt.push_str(&format!(
-            "\nThis is attempt {} of this task. Earlier attempts ran and were abandoned. Their steps were not undone.",
+            "\nThis is attempt {} of this task. The earlier attempts stopped before they finished. The host did not undo their steps.",
             inp.attempt
         ));
     }
@@ -138,7 +138,7 @@ fn run_agent() -> anyhow::Result<()> {
             // A truncated or botched tool batch with no answer in it goes back
             // to the model: publishing it would leak protocol as the answer.
             Err(e) if looks_like_tool_batch(&chat) && recover_answer_field(&chat).is_none() => {
-                reply_again(&mut messages, chat, format!("Your reply did not parse as an actions batch ({e}). Reply again with exactly one valid JSON object."));
+                reply_again(&mut messages, chat, format!("Your reply is not a valid actions object: {e}. Reply again with exactly one valid JSON object."));
                 continue;
             }
             // Any other reply that does not parse — prose, or a truncated final

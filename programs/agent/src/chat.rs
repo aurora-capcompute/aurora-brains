@@ -7,9 +7,11 @@
 
 use super::*;
 
-const SUMMARY_PROMPT: &str = "You compress an AI agent's earlier working log. Preserve every fact, URL, identifier, number, finding, and decision needed to finish the task; drop repetition and chatter. Reply with prose only — no JSON, no tool calls.";
+const SUMMARY_PROMPT: &str = "You compress the earlier work log of an AI agent. Keep every fact, URL, identifier, number, finding and decision that the agent needs to finish the task. Remove repetition and text that gives no information. Reply with prose only. Do not write JSON or tool calls.";
 
-const FINAL_DIRECTIVE: &str = "You have reached this run's step or size limit. Reply now with EXACTLY one final action and no tool calls: {\"actions\":[{\"action\":\"final\",\"content\":{\"answer\":\"...\"}}]}. Base the answer on what you already have.";
+const FINAL_DIRECTIVE: &str = r#"This run is at its step or size limit. Reply now with exactly one final action, and with no tool calls:
+{"actions":[{"action":"final","content":{"answer":"..."}}]}
+Write the answer from the information that you have now."#;
 
 // chat_in_section makes one LLM call inside its own section. An LLM call has no
 // effects, so it is safe to run again: when it fails, the section stays open
@@ -80,7 +82,8 @@ fn shrink_messages(messages: &mut [Message]) -> bool {
     let keep = count / 2;
     let head: String = chars[..keep / 2].iter().collect();
     let tail: String = chars[count - (keep - keep / 2)..].iter().collect();
-    messages[i].content = format!("{head}\n…[truncated to fit the request limit]…\n{tail}");
+    messages[i].content =
+        format!("{head}\n…[The host cut this text to fit the request limit.]…\n{tail}");
     true
 }
 
@@ -116,7 +119,7 @@ pub(crate) fn maybe_compact(messages: &mut Vec<Message>, head: usize) -> anyhow:
     rebuilt.extend_from_slice(&messages[..head]);
     rebuilt.push(Message {
         role: "user".into(),
-        content: format!("[Earlier steps, compacted to save context]\n{}", summary),
+        content: format!("[A summary of the earlier steps. The host put it in place of the steps to save space.]\n{}", summary),
     });
     rebuilt.extend_from_slice(&messages[split..]);
     *messages = rebuilt;

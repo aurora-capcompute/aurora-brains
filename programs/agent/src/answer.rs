@@ -62,7 +62,7 @@ pub(crate) fn reply_again(messages: &mut Vec<Message>, reply: String, note: Stri
 
 // answer_rejected is the note on a final answer that was not accepted.
 pub(crate) fn answer_rejected(reason: &str) -> String {
-    format!("Your final answer was not accepted: {reason}. Reply again with a final action whose answer fits.")
+    format!("The host did not accept your final answer: {reason}. Correct the answer. Then reply again with a final action.")
 }
 
 // salvage_answer extracts a usable answer from a reply that would not parse as a
@@ -89,7 +89,7 @@ fn salvage_answer(chat: &str) -> String {
     // no recoverable answer above must not be echoed verbatim — that would publish
     // raw {"actions":...} protocol text as the answer. Fall back to the note.
     if trimmed.is_empty() || looks_like_tool_batch(trimmed) {
-        "Reached the step or size limit before completing the task.".into()
+        "The run reached its step or size limit before it finished the task.".into()
     } else {
         trimmed.to_string()
     }
