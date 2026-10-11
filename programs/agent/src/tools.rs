@@ -167,7 +167,7 @@ fn strip_internet_html(action: &str, args: &Value, result: &mut Option<Value>) {
 // result is shown only as its key and its size: the model reads it through
 // core.scratch, or summarizes it. Two kinds of result are not saved and come
 // back whole: scratch's own, because they are how the model reads, and the
-// runtime's sys.* calls (a timer, a declassify), whose results are small and
+// runtime's sys.* calls (a timer), whose results are small and
 // fixed. An unsaved result comes back whole up to INLINE_LIMIT, else as its
 // size and head. The LLM's replies never pass through here: they are the
 // conversation itself.
